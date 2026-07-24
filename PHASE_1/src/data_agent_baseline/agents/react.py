@@ -15,9 +15,10 @@ from data_agent_baseline.agents.prompt import (
     build_task_prompt,
 )
 from data_agent_baseline.agents.runtime import AgentRunResult, AgentRuntimeState, StepRecord
-from data_agent_baseline.benchmark.schema import PublicTask
+from data_agent_baseline.benchmark.schema import AnswerTable, PublicTask
 from data_agent_baseline.events import EventSink, emit_event
-from data_agent_baseline.tools.registry import ToolRegistry
+from data_agent_baseline.tools.registry import ToolExecutionResult, ToolRegistry
+from data_agent_baseline.verification import AnswerVerifier, AnswerVerificationFailure
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +55,23 @@ def _protocol_error_observation(code: str, message: str) -> dict[str, object]:
     }
 
 
+def _answer_verification_event_payload(
+    *,
+    call: ModelToolCall,
+    answer: AnswerTable,
+    step_index: int,
+    failure: AnswerVerificationFailure,
+) -> dict[str, object]:
+    return {
+        "step_index": step_index,
+        "tool_call_id": call.id,
+        "column_count": len(answer.columns),
+        "row_count": len(answer.rows),
+        "verification_code": failure.code,
+        "error": failure.message,
+    }
+
+
 class ReActAgent:
     def __init__(
         self,
@@ -63,12 +81,14 @@ class ReActAgent:
         config: ReActAgentConfig | None = None,
         system_prompt: str | None = None,
         event_sink: EventSink | None = None,
+        answer_verifier: AnswerVerifier | None = None,
     ) -> None:
         self.model = model
         self.tools = tools
         self.config = config or ReActAgentConfig()
         self.system_prompt = system_prompt or REACT_SYSTEM_PROMPT
         self.event_sink = event_sink
+        self.answer_verifier = answer_verifier or AnswerVerifier()
 
     def _initial_messages(self, task: PublicTask) -> list[ModelMessage]:
         return [
@@ -100,7 +120,6 @@ class ReActAgent:
                 "tool_call_count": len(response.tool_calls),
             },
         )
-
         calls_are_replayable = bool(response.tool_calls) and all(
             call.id and call.name for call in response.tool_calls
         )
@@ -139,6 +158,56 @@ class ReActAgent:
                 "step_index": step_index,
                 "step": step_record.to_dict(),
             },
+        )
+
+    def _verify_terminal_answer(
+        self,
+        *,
+        call: ModelToolCall,
+        tool_result: ToolExecutionResult,
+        step_index: int,
+    ) -> ToolExecutionResult:
+        answer = tool_result.answer
+        if answer is None:
+            return tool_result
+
+        failure = self.answer_verifier.verify(answer)
+        if failure is None:
+            emit_event(
+                self.event_sink,
+                "answer_verification_passed",
+                {
+                    "step_index": step_index,
+                    "tool_call_id": call.id,
+                    "column_count": len(answer.columns),
+                    "row_count": len(answer.rows),
+                },
+            )
+            return tool_result
+
+        emit_event(
+            self.event_sink,
+            "answer_verification_rejected",
+            _answer_verification_event_payload(
+                call=call,
+                answer=answer,
+                step_index=step_index,
+                failure=failure,
+            ),
+        )
+        return ToolExecutionResult(
+            ok=False,
+            content={
+                "error": {
+                    "code": "ANSWER_VERIFICATION_ERROR",
+                    "verification_code": failure.code,
+                    "message": failure.message,
+                    "recoverable": True,
+                }
+            },
+            action_input=tool_result.action_input,
+            error_code="ANSWER_VERIFICATION_ERROR",
+            recoverable=True,
         )
 
     def run(self, task: PublicTask) -> AgentRunResult:
@@ -208,6 +277,12 @@ class ReActAgent:
                 },
             )
             tool_result = self.tools.execute(task, call)
+            if tool_result.is_terminal:
+                tool_result = self._verify_terminal_answer(
+                    call=call,
+                    tool_result=tool_result,
+                    step_index=step_index,
+                )
             tool_event_payload = {
                 "step_index": step_index,
                 "tool_call_id": call.id,

@@ -167,6 +167,8 @@ uv run dabench run-benchmark \
 `tool_call`，注册表在执行前使用 Pydantic 校验 JSON 参数，结果再通过带有匹配
 `tool_call_id` 的 `tool` 消息返回。现有 `agent.api_base` 配置也可直接连接阿里云百炼
 OpenAI-compatible Chat Completions 接口。
+`answer` 调用还必须通过确定性的 CSV 安全校验才能终止任务；被拒绝的候选答案会收到可恢复
+的工具观察，以便模型修正后重提。
 
 当前暴露给模型的工具有：
 
@@ -229,6 +231,8 @@ uv run dabench score-run artifacts/runs/<run_id> \
 [`docs/2026-07-24-runner-reliability.md`](docs/2026-07-24-runner-reliability.md)。
 原生工具协议、参数校验、Trace 兼容策略和验证结果记录在
 [`docs/2026-07-24-native-tool-calling.md`](docs/2026-07-24-native-tool-calling.md)。
+确定性的提交前校验和纠错流程见
+[`docs/2026-07-24-answer-verification.md`](docs/2026-07-24-answer-verification.md)。
 
 ## Contact
 
