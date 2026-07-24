@@ -84,6 +84,10 @@ def test_runs_native_tool_loop_and_replays_matching_call_id(tmp_path):
     assert second_request[3].tool_call_id == "call_list"
     tool_started = next(payload for kind, payload in events if kind == "tool_started")
     assert tool_started["tool_call_id"] == "call_list"
+    verification_passed = next(
+        payload for kind, payload in events if kind == "answer_verification_passed"
+    )
+    assert verification_passed["tool_call_id"] == "call_answer_one"
 
 
 def test_returns_validation_error_to_model_and_allows_correction(tmp_path):
@@ -172,3 +176,62 @@ def test_max_steps_failure_preserves_protocol_error_trace(tmp_path):
     assert result.succeeded is False
     assert result.failure_reason == "Agent did not submit an answer within max_steps."
     assert result.steps[0].finish_reason == "stop"
+
+
+def test_rejects_invalid_answer_then_allows_native_correction(tmp_path):
+    model = ScriptedModelAdapter(
+        [
+            _tool_response(
+                "answer",
+                {"columns": ["name", " name "], "rows": [["Alice", "Alice"]]},
+                call_id="call_rejected_answer",
+            ),
+            _answer_response(),
+        ]
+    )
+    events = []
+    agent = ReActAgent(
+        model=model,
+        tools=create_default_tool_registry(),
+        event_sink=lambda event_type, payload: events.append((event_type, payload)),
+    )
+
+    result = agent.run(_task(tmp_path))
+
+    assert result.succeeded is True
+    assert [step.ok for step in result.steps] == [False, True]
+    rejected = result.steps[0]
+    assert rejected.tool_call_id == "call_rejected_answer"
+    error = rejected.observation["content"]["error"]
+    assert error["code"] == "ANSWER_VERIFICATION_ERROR"
+    assert error["verification_code"] == "DUPLICATE_COLUMN_NAME"
+    correction_observation = model.requests[1][-1]
+    assert correction_observation.role == "tool"
+    assert correction_observation.tool_call_id == "call_rejected_answer"
+    assert "ANSWER_VERIFICATION_ERROR" in correction_observation.content
+    rejected_event = next(
+        payload for kind, payload in events if kind == "answer_verification_rejected"
+    )
+    assert rejected_event["verification_code"] == "DUPLICATE_COLUMN_NAME"
+    tool_failed = next(payload for kind, payload in events if kind == "tool_failed")
+    assert tool_failed["error_code"] == "ANSWER_VERIFICATION_ERROR"
+
+
+def test_rejected_answer_exhausts_steps_without_becoming_terminal(tmp_path):
+    invalid_answer = _tool_response(
+        "answer",
+        {"columns": ["value"], "rows": [[None]]},
+        call_id="call_only_answer",
+    )
+    agent = ReActAgent(
+        model=ScriptedModelAdapter([invalid_answer]),
+        tools=create_default_tool_registry(),
+        config=ReActAgentConfig(max_steps=1),
+    )
+
+    result = agent.run(_task(tmp_path))
+
+    assert result.succeeded is False
+    assert result.answer is None
+    assert result.failure_reason == "Agent did not submit an answer within max_steps."
+    assert result.steps[0].observation["content"]["error"]["code"] == ("ANSWER_VERIFICATION_ERROR")

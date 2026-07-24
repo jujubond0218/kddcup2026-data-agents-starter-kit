@@ -167,6 +167,8 @@ uv run dabench run-benchmark \
 Tools are advertised through the OpenAI-compatible native `tools` field. The model returns
 one `tool_call` per turn, the registry validates its JSON arguments with Pydantic before
 execution, and the result is returned as a `tool` message with the matching `tool_call_id`.
+An `answer` call must also pass deterministic CSV-safety verification before it can terminate
+the task; rejected candidates receive a recoverable tool observation for correction.
 The same Chat Completions flow works with Alibaba Cloud Model Studio's OpenAI-compatible
 endpoint through the existing `agent.api_base` setting.
 
@@ -234,6 +236,8 @@ reliability work are recorded in
 The native tool protocol, validation behavior, trace compatibility, and verification
 results are recorded in
 [`docs/2026-07-24-native-tool-calling.md`](docs/2026-07-24-native-tool-calling.md).
+The deterministic pre-submit checks and correction flow are documented in
+[`docs/2026-07-24-answer-verification.md`](docs/2026-07-24-answer-verification.md).
 
 ## Contact
 

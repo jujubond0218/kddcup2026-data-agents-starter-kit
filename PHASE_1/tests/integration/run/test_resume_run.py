@@ -62,6 +62,27 @@ def _answer_response(value: str) -> ModelResponse:
     )
 
 
+def _invalid_answer_response() -> ModelResponse:
+    arguments = json.dumps(
+        {
+            "columns": ["value", " value "],
+            "rows": [["invalid", "invalid"]],
+        },
+        separators=(",", ":"),
+    )
+    call = ModelToolCall(
+        id="call_invalid_answer",
+        name="answer",
+        arguments=arguments,
+    )
+    return ModelResponse(
+        content="",
+        tool_calls=(call,),
+        raw_response=json.dumps({"tool_calls": [call.to_openai_dict()]}),
+        finish_reason="tool_calls",
+    )
+
+
 def _no_tool_response() -> ModelResponse:
     return ModelResponse(
         content="I cannot call a tool.",
@@ -158,3 +179,49 @@ def test_resume_reruns_success_with_missing_prediction(tmp_path):
     summary = json.loads((run_output_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary["resumed_task_count"] == 0
     assert summary["executed_task_count"] == 1
+
+
+def test_runner_writes_only_the_corrected_verified_answer(tmp_path):
+    config = _config(tmp_path, run_id="verified-answer", max_steps=2)
+    _write_task(config.dataset.root_path, "task_1")
+
+    run_output_dir, artifacts = run_benchmark(
+        config=config,
+        model=ScriptedModelAdapter([_invalid_answer_response(), _answer_response("fixed")]),
+        tools=create_default_tool_registry(),
+        task_ids=["task_1"],
+    )
+
+    artifact = artifacts[0]
+    assert artifact.succeeded is True
+    assert artifact.prediction_csv_path is not None
+    assert artifact.prediction_csv_path.read_text(encoding="utf-8") == "value\nfixed\n"
+    trace = json.loads((run_output_dir / "task_1" / "trace.json").read_text(encoding="utf-8"))
+    assert trace["steps"][0]["observation"]["content"]["error"]["code"] == (
+        "ANSWER_VERIFICATION_ERROR"
+    )
+    events = [
+        json.loads(line)
+        for line in (run_output_dir / "task_1" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert any(event["event_type"] == "answer_verification_rejected" for event in events)
+    assert any(event["event_type"] == "answer_verification_passed" for event in events)
+
+
+def test_runner_does_not_write_a_rejected_answer(tmp_path):
+    config = _config(tmp_path, run_id="rejected-answer", max_steps=1)
+    _write_task(config.dataset.root_path, "task_1")
+
+    run_output_dir, artifacts = run_benchmark(
+        config=config,
+        model=ScriptedModelAdapter([_invalid_answer_response()]),
+        tools=create_default_tool_registry(),
+        task_ids=["task_1"],
+    )
+
+    artifact = artifacts[0]
+    assert artifact.succeeded is False
+    assert artifact.prediction_csv_path is None
+    assert not (run_output_dir / "task_1" / "prediction.csv").exists()
