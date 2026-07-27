@@ -89,4 +89,40 @@ Explorer 子 Agent 请求；真实服务实验实际验证的是“自动确定�
 
 相对 `master` 最佳一次，逐题分数有 46 题不变、2 题提升、2 题退化，净总分仅增加
 0.0010，远小于单轮模型服务波动所能排除的范围。v2 明确消除了 v1 的固定子 Agent 成本，
-但没有同时保持 Runner 可靠性，因此不满足本 PR 的验收条件，不提交或创建 PR。
+但没有同时保持 Runner 可靠性，因此不满足创建 PR 的验收条件。该实现仅作为后续优化的
+可复现检查点提交到个人 Fork 分支，尚未创建 PR。
+
+## Bad-case 定向增强
+
+Evidence-first v2 的确定性 Inventory 能消除强制子 Agent 的固定成本，但真实实验中主
+Agent 从未主动调用可选的 `explore`，说明仅靠 Prompt 建议无法稳定触发需要补充证据的
+任务。本轮增强不按任务 ID 编写规则，而是从 Inventory 中可观察的结构事实生成客观歧义：
+大 JSON 的部分结构、宽表与其他结构化来源并存，以及多个来源之间的同名字段、兼容类型
+或有限样本值重叠。
+
+Inventory schema 升级为 v2，并增加以下只读派生信息：
+
+- `relation_candidates` 最多 12 个，记录路径、表、字段和候选关系信号；所有连接关系都
+  明确标记为 candidate，不能作为已验证事实。
+- `exploration` 包含 `recommended`、合并后的 `focus`、最多 8 个 `candidate_paths` 和
+  `ambiguity_codes`。这些字段由通用确定性规则产生。
+- 大 JSON 使用 `ijson` 在现有单文件字节预算内流式提取顶层类型、最多 48 个嵌套字段
+  路径、类型和 3 个有界对象样本；预算耗尽保留已有证据并标记截断，损坏输入仍然
+  fail-open。
+
+当 `exploration.recommended=true` 时，主 Agent 的首次模型请求只暴露 `explore`，并要求
+使用 Inventory 给出的精确 `focus` 和 `candidate_paths`。Explorer 完成或返回可恢复失败
+后，运行时移除 `explore` 并恢复原有工具，避免重复探索。没有客观歧义、Explorer 被禁用
+或 Inventory 扫描失败时，链路保持 v2 行为。
+
+Explorer 报告增加 `recommended_checks`，仅允许 `source_relevance`、`field_semantics`、
+`join_coverage` 和 `filter_domain` 四类检查。每项检查必须引用已存在的 evidence ID、候选
+路径和真实字段，不允许携带可执行 SQL 或 Python。`context_inventory_created` 事件只增加
+是否推荐探索、歧义数量和候选关系数量等聚合字段，不写入 Inventory、原始样本或模型内容。
+
+固定快速评测清单位于 `configs/explorer_bad_cases.example.txt`。其中 9 个活动任务用于
+验证 Explorer 可改善的核心组和观察组，6 个注释任务作为非 Explorer 对照。任务 ID 只属于
+评测配置，不参与任何运行时分支。9 题进入全量实验的门槛为至少 2 题从零变为非零、Runner
+成功不少于 6/9、缺失不超过 3，并满足每个被标记任务仅调用一次 Explorer、子 Agent 请求
+和 preview 预算。只有通过该门槛才运行一次 50 题实验；单轮结果只记录为当前配置下的
+观测，不用于宣称稳定因果提升。

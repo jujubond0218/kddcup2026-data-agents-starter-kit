@@ -319,6 +319,7 @@ class ScriptedModelAdapter:
     def __init__(self, responses: list[ModelResponse]) -> None:
         self._responses = list(responses)
         self.requests: list[list[ModelMessage]] = []
+        self.requested_tool_names: list[tuple[str, ...]] = []
 
     def complete(
         self,
@@ -327,9 +328,16 @@ class ScriptedModelAdapter:
         tools: ToolSchemaSource | None = None,
         request_context: dict[str, Any] | None = None,
     ) -> ModelResponse:
-        del tools
         del request_context
         self.requests.append(list(messages))
+        rendered_tools = tools.to_openai_tools() if tools is not None else []
+        self.requested_tool_names.append(
+            tuple(
+                str(item.get("function", {}).get("name", ""))
+                for item in rendered_tools
+                if isinstance(item, dict)
+            )
+        )
         if not self._responses:
             raise RuntimeError("No scripted model responses remaining.")
         return self._responses.pop(0)

@@ -147,6 +147,7 @@ def _run_single_task_core(
                 separators=(",", ":"),
                 default=str,
             )
+            exploration = full_inventory.get("exploration", {})
             emit_event(
                 event_sink,
                 "context_inventory_created",
@@ -161,13 +162,23 @@ def _run_single_task_core(
                     "truncated": bool(full_inventory.get("truncated")),
                     "prompt_chars": len(rendered_inventory),
                     "read_bytes": full_inventory.get("budget", {}).get("read_bytes", 0),
+                    "exploration_recommended": bool(exploration.get("recommended")),
+                    "ambiguity_count": len(exploration.get("ambiguity_codes", [])),
+                    "relation_candidate_count": len(full_inventory.get("relation_candidates", [])),
                 },
             )
         except Exception as exc:  # noqa: BLE001
             prompt_inventory = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "status": "failed",
                 "files": [],
+                "exploration": {
+                    "recommended": False,
+                    "focus": "",
+                    "candidate_paths": [],
+                    "ambiguity_codes": [],
+                },
+                "relation_candidates": [],
                 "warnings": [
                     {
                         "code": "CONTEXT_INVENTORY_FAILED",
@@ -191,6 +202,9 @@ def _run_single_task_core(
         and config.explorer.enabled
         and full_inventory is not None
         and full_inventory.get("files")
+        and full_inventory.get("exploration", {}).get("recommended") is True
+        and prompt_inventory is not None
+        and prompt_inventory.get("exploration", {}).get("recommended") is True
     ):
         specs = dict(effective_tools.specs)
         specs["explore"] = create_explorer_tool_spec(

@@ -25,22 +25,33 @@ Keep reasoning concise and grounded in the observed data.
 
 
 def build_system_prompt(
-    system_prompt: str | None = None, *, explore_available: bool = False
+    system_prompt: str | None = None,
+    *,
+    explore_available: bool = False,
+    explore_required: bool = False,
 ) -> str:
     prompt = system_prompt or REACT_SYSTEM_PROMPT
     if explore_available:
+        trigger_instruction = (
+            "The Inventory marks exploration.recommended=true. Your first tool call must be "
+            "`explore`, using exploration.focus and exploration.candidate_paths exactly. "
+            "The tool is available only for that first focused exploration."
+            if explore_required
+            else (
+                "Call `explore` only when that Inventory leaves a specific ambiguity about "
+                "source selection, field semantics, joins, or document mapping."
+            )
+        )
         prompt += (
             "\n7. A deterministic Context Inventory is included in the task message. "
-            "Use its paths, schemas, and samples directly; do not repeat discovery that it "
-            "already provides.\n"
-            "8. Call `explore` only when that Inventory leaves a specific ambiguity about "
-            "source selection, field semantics, joins, or document mapping. Pass a concise "
-            "focus and candidate_paths copied exactly from the Inventory.\n"
-            "9. Treat Inventory and returned evidence observations as facts. Treat key-field "
-            "and join candidates as hypotheses that must be verified with the normal tools "
-            "before computation. Inventory samples prove only the displayed values; when a "
-            "file is truncated or row_count is null, use a normal tool for complete filtering "
-            "or aggregation. Actual queried data wins on conflict."
+            "Use its paths, schemas, samples, and relation candidates directly; do not repeat "
+            "discovery that it already provides.\n"
+            f"8. {trigger_instruction}\n"
+            "9. Treat Inventory and returned evidence observations as facts. Treat relation, "
+            "key-field, join, and recommended-check entries as candidates that must be verified "
+            "with normal tools before computation. Inventory samples prove only displayed "
+            "values; when a file is truncated or row_count is null, query the complete data. "
+            "Actual queried data wins on conflict."
         )
     return prompt
 

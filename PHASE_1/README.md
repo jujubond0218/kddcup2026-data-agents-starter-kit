@@ -128,7 +128,7 @@ Config fields:
 | `run.run_id` | Optional run directory name. Defaults to a UTC timestamp if omitted. Required by `--resume`. |
 | `run.max_workers` | Parallel worker count for `run-benchmark`. |
 | `run.task_timeout_seconds` | Maximum wall-clock time per task. Set to `0` or a negative value to disable the task-level timeout. |
-| `explorer.enabled` | Injects a bounded deterministic Context Inventory and enables the optional focused `explore` tool. |
+| `explorer.enabled` | Injects Inventory v2. When deterministic ambiguity signals recommend exploration, the first model turn exposes one focused `explore` call before restoring the normal tools. |
 | `explorer.max_steps` | Maximum native tool-calling steps available to one focused Explorer run. |
 | `explorer.max_prompt_inventory_chars` | Maximum serialized Inventory characters injected before the first model request. |
 
@@ -158,6 +158,14 @@ Run the fixed 11-task regression selection:
 uv run dabench run-benchmark \
   --config configs/react_baseline.local.yaml \
   --task-file configs/regression_tasks.example.txt
+```
+
+Run the fixed nine-task Explorer bad-case selection:
+
+```bash
+uv run dabench run-benchmark \
+  --config configs/react_baseline.local.yaml \
+  --task-file configs/explorer_bad_cases.example.txt
 ```
 
 Set `run.run_id` to the existing run directory name, then resume an interrupted run or
@@ -190,7 +198,7 @@ The baseline exposes these tools to the model:
 | Tool | Purpose | Inputs |
 | --- | --- | --- |
 | `list_context` | List files and directories under `context/`. | `max_depth` |
-| `explore` | Resolve a specific ambiguity over Inventory-selected files with a bounded evidence-first sub-agent. | `focus`, `candidate_paths` |
+| `explore` | Resolve an Inventory-v2 ambiguity with one bounded evidence-first sub-agent call; it is exposed only for the required first turn and then removed. | `focus`, `candidate_paths` |
 | `read_csv` | Read a CSV preview. | `path`, `max_rows` |
 | `read_json` | Read a JSON preview. | `path`, `max_chars` |
 | `read_doc` | Read a text document preview. | `path`, `max_chars` |

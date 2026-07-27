@@ -128,7 +128,7 @@ explorer:
 | `run.run_id` | 可选，指定运行目录名。不传时默认使用 UTC 时间戳；使用 `--resume` 时必须填写。 |
 | `run.max_workers` | `run-benchmark` 并行 worker 数。 |
 | `run.task_timeout_seconds` | 单个任务允许的最长墙钟时间。设为 `0` 或负数可关闭任务级超时。 |
-| `explorer.enabled` | 是否注入受预算的确定性 Context Inventory，并启用可选定向 `explore` 工具。 |
+| `explorer.enabled` | 是否注入 Inventory v2；确定性歧义信号建议探索时，首次模型请求只暴露一次定向 `explore`，之后恢复常规工具。 |
 | `explorer.max_steps` | 单次定向 Explorer 最多可使用的原生工具调用步数。 |
 | `explorer.max_prompt_inventory_chars` | 首次模型请求前注入的序列化 Inventory 最大字符数。 |
 
@@ -160,6 +160,14 @@ uv run dabench run-benchmark \
   --task-file configs/regression_tasks.example.txt
 ```
 
+运行固定的 9 题 Explorer bad-case 回归集：
+
+```bash
+uv run dabench run-benchmark \
+  --config configs/react_baseline.local.yaml \
+  --task-file configs/explorer_bad_cases.example.txt
+```
+
 先把 `run.run_id` 设置为已有运行目录名，再恢复中断运行或只重试已经完成的失败任务：
 
 ```bash
@@ -188,7 +196,7 @@ OpenAI-compatible Chat Completions 接口。
 | 工具 | 作用 | 输入 |
 | --- | --- | --- |
 | `list_context` | 列出 `context/` 下的文件和目录。 | `max_depth` |
-| `explore` | 对 Inventory 中选定文件的具体歧义运行受限 evidence-first 子 Agent。 | `focus`、`candidate_paths` |
+| `explore` | 对 Inventory v2 标记的歧义运行一次受限 evidence-first 子 Agent；只在要求探索的首次请求中暴露，随后移除。 | `focus`、`candidate_paths` |
 | `read_csv` | 读取 CSV 预览。 | `path`、`max_rows` |
 | `read_json` | 读取 JSON 预览。 | `path`、`max_chars` |
 | `read_doc` | 读取文本文档预览。 | `path`、`max_chars` |

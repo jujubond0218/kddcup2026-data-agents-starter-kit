@@ -55,15 +55,21 @@ def test_inventory_returns_bounded_mixed_context_schema(tmp_path):
 
 def test_inventory_warns_for_large_and_damaged_files_without_raising(tmp_path):
     task = _task(tmp_path)
-    (task.context_dir / "large.json").write_text("[" + "x" * 2_000 + "]", encoding="utf-8")
+    (task.context_dir / "large.json").write_text(
+        json.dumps([{"record": {"id": index, "label": f"value-{index}"}} for index in range(100)]),
+        encoding="utf-8",
+    )
     (task.context_dir / "broken.json").write_text("{not-json", encoding="utf-8")
 
     report = inspect_context(task, _limits(max_single_file_bytes=100))
 
     codes = {warning["code"] for warning in report["warnings"]}
-    assert "JSON_PARSE_SKIPPED" in codes
+    assert "JSON_STREAM_TRUNCATED" in codes
     assert "JSON_PARSE_ERROR" in codes
     assert report["budget"]["read_bytes"] <= 200
+    large = next(entry for entry in report["files"] if entry["path"] == "large.json")
+    assert "record.id" in large["summary"]["field_paths"]
+    assert len(large["summary"]["sample_objects"]) <= 3
 
 
 def test_inventory_respects_file_and_rendering_budgets(tmp_path):
@@ -105,6 +111,55 @@ def test_compact_inventory_is_detached_and_respects_prompt_budget(tmp_path):
     assert compact["files"][0]["summary"]["columns"] == ["id", "value"]
     assert "sample_rows" not in compact["files"][0]["summary"]
     assert inventory["files"][0].get("summary") is not None
+
+
+def test_inventory_builds_bounded_relation_candidates_and_exploration_request(tmp_path):
+    task = _task(tmp_path)
+    (task.context_dir / "orders.csv").write_text(
+        "customer_id,region,amount\nC1,north,10\nC2,south,20\n",
+        encoding="utf-8",
+    )
+    database_path = task.context_dir / "customers.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE customers (customer_id TEXT, region TEXT, amount INTEGER, name TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO customers VALUES (?, ?, ?, ?)",
+            [("C1", "north", 10, "Ada"), ("C2", "south", 20, "Lin")],
+        )
+    task = PublicTask(
+        record=TaskRecord(
+            task_id=task.task_id,
+            difficulty=task.difficulty,
+            question="Find the amount and region for each customer_id.",
+        ),
+        assets=task.assets,
+    )
+
+    report = inspect_context(task, _limits(max_inventory_chars=12_000))
+
+    assert report["schema_version"] == 2
+    assert report["exploration"]["recommended"] is True
+    assert len(report["exploration"]["candidate_paths"]) <= 8
+    assert len(report["relation_candidates"]) <= 12
+    assert all(item["status"] == "candidate" for item in report["relation_candidates"])
+    assert any(
+        item["signals"]["sample_overlap_count"] >= 2 for item in report["relation_candidates"]
+    )
+    assert "_field_profiles" not in json.dumps(report)
+
+
+def test_relation_candidates_alone_do_not_force_exploration(tmp_path):
+    task = _task(tmp_path)
+    (task.context_dir / "left.csv").write_text("id,value\n1,a\n2,b\n", encoding="utf-8")
+    (task.context_dir / "right.csv").write_text("id,value\n1,a\n2,b\n", encoding="utf-8")
+
+    report = inspect_context(task, _limits())
+
+    assert report["relation_candidates"]
+    assert report["exploration"]["recommended"] is False
+    assert report["exploration"]["candidate_paths"] == []
 
 
 def test_targeted_preview_is_deeper_than_inventory_and_output_is_bounded(tmp_path):

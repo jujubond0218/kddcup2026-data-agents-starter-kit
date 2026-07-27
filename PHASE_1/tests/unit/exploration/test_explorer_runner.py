@@ -78,6 +78,7 @@ def _report(*, evidence_ref: str = "preview:1") -> dict:
             }
         ],
         "join_candidates": [],
+        "recommended_checks": [],
         "etl_candidates": [],
         "warnings": [],
         "uncertainties": [],
@@ -247,6 +248,33 @@ def test_report_rejects_unknown_evidence_and_unselected_paths(tmp_path):
     assert invalid_path.error_code == "REPORT_PATH_NOT_SELECTED"
 
 
+def test_report_validates_recommended_check_fields_against_evidence(tmp_path):
+    task = _task(tmp_path)
+    config = ExplorerConfig()
+    tools = _ExplorerTools(
+        config=config,
+        inventory=_inventory(task, config),
+        candidate_paths=["sales.csv"],
+    )
+    payload = _report(evidence_ref="inventory:1")
+    payload["recommended_checks"] = [
+        {
+            "check_type": "filter_domain",
+            "paths": ["sales.csv"],
+            "fields": [{"path": "sales.csv", "field": "amount", "table": None}],
+            "instruction": "Confirm the complete amount domain before filtering.",
+            "evidence_refs": ["inventory:1"],
+        }
+    ]
+
+    valid = tools.report(task, ExplorerReportInput.model_validate(payload))
+    payload["recommended_checks"][0]["fields"][0]["field"] = "invented"
+    invalid = tools.report(task, ExplorerReportInput.model_validate(payload))
+
+    assert valid.ok is True
+    assert invalid.error_code == "UNKNOWN_FIELD_REF"
+
+
 def test_report_schema_cannot_overwrite_inventory():
     payload = _report(evidence_ref="inventory:1")
     payload["inventory"] = {"files": []}
@@ -284,6 +312,43 @@ def test_explore_tool_rejects_paths_missing_from_inventory(tmp_path):
 
     assert result.error_code == "INVALID_CANDIDATE_PATH"
     assert model.requests == []
+
+
+def test_explore_tool_requires_exact_inventory_request_when_recommended(tmp_path):
+    task = _task(tmp_path)
+    config = ExplorerConfig()
+    inventory = _inventory(task, config)
+    inventory["exploration"] = {
+        "recommended": True,
+        "focus": "Resolve the supplied ambiguity.",
+        "candidate_paths": ["sales.csv"],
+        "ambiguity_codes": ["TEST_AMBIGUITY"],
+    }
+    registry = ToolRegistry(
+        specs={
+            "explore": create_explorer_tool_spec(
+                model=ScriptedModelAdapter([]),
+                config=config,
+                inventory=inventory,
+            )
+        }
+    )
+
+    result = registry.execute(
+        task,
+        ModelToolCall(
+            id="mismatch",
+            name="explore",
+            arguments=json.dumps(
+                {
+                    "focus": "Different focus.",
+                    "candidate_paths": ["sales.csv"],
+                }
+            ),
+        ),
+    )
+
+    assert result.error_code == "EXPLORATION_REQUEST_MISMATCH"
 
 
 def test_main_agent_can_skip_explore_when_inventory_is_sufficient(tmp_path):
@@ -379,7 +444,7 @@ def test_runner_injects_inventory_without_forcing_explorer(tmp_path):
 
     assert artifacts[0].succeeded is True
     assert "Context Inventory" in model.requests[0][1].content
-    assert "Call `explore` only when" in model.requests[0][0].content
+    assert "`explore`" not in model.requests[0][0].content
     events = [
         json.loads(line)
         for line in (run_output_dir / "task_1" / "events.jsonl")
@@ -389,7 +454,94 @@ def test_runner_injects_inventory_without_forcing_explorer(tmp_path):
     created = next(event for event in events if event["event_type"] == "context_inventory_created")
     assert created["file_count"] == 1
     assert created["prompt_chars"] <= config.explorer.max_prompt_inventory_chars
+    assert created["exploration_recommended"] is False
+    assert created["ambiguity_count"] == 0
+    assert created["relation_candidate_count"] == 0
     assert not any(event["event_type"] == "explorer_started" for event in events)
+
+
+def test_runner_requires_one_explore_then_removes_tool_for_recommended_inventory(tmp_path):
+    task = _task(tmp_path)
+    columns = [f"field_{index}" for index in range(20)]
+    (task.context_dir / "wide.csv").write_text(
+        ",".join(columns) + "\n" + ",".join(str(index) for index in range(20)) + "\n",
+        encoding="utf-8",
+    )
+    (task.task_dir / "task.json").write_text(
+        json.dumps(
+            {
+                "task_id": "task_1",
+                "difficulty": "easy",
+                "question": "Find sales.",
+            }
+        ),
+        encoding="utf-8",
+    )
+    explorer_config = ExplorerConfig()
+    inventory = _inventory(task, explorer_config)
+    exploration = inventory["exploration"]
+    assert exploration["recommended"] is True
+    empty_report = {
+        "selected_sources": [],
+        "evidence_refs": [],
+        "key_fields": [],
+        "join_candidates": [],
+        "recommended_checks": [],
+        "etl_candidates": [],
+        "warnings": [],
+        "uncertainties": [],
+    }
+    model = ScriptedModelAdapter(
+        [
+            _response(
+                "explore",
+                {
+                    "focus": exploration["focus"],
+                    "candidate_paths": exploration["candidate_paths"],
+                },
+                "main_explore",
+            ),
+            _response("report", empty_report, "explorer_report"),
+            _response(
+                "explore",
+                {
+                    "focus": exploration["focus"],
+                    "candidate_paths": exploration["candidate_paths"],
+                },
+                "repeated_explore",
+            ),
+            _response("answer", {"columns": ["amount"], "rows": [["10"]]}, "main_answer"),
+        ]
+    )
+    config = AppConfig(
+        dataset=DatasetConfig(root_path=tmp_path),
+        agent=AgentConfig(api_key="test-key"),
+        run=RunConfig(output_dir=tmp_path / "runs", run_id="required-explorer", max_workers=1),
+    )
+
+    run_output_dir, artifacts = run_benchmark(
+        config=config,
+        model=model,
+        task_ids=["task_1"],
+    )
+
+    trace = json.loads(artifacts[0].trace_path.read_text(encoding="utf-8"))
+    assert artifacts[0].succeeded is True
+    assert [step["action"] for step in trace["steps"]] == ["explore", "explore", "answer"]
+    assert trace["steps"][0]["tool_call_id"] == "main_explore"
+    assert trace["steps"][1]["observation"]["content"]["error"]["code"] == "UNKNOWN_TOOL"
+    assert model.requested_tool_names[0] == ("explore",)
+    assert "explore" not in model.requested_tool_names[2]
+    assert "answer" in model.requested_tool_names[2]
+    events = [
+        json.loads(line)
+        for line in (run_output_dir / "task_1" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert sum(event["event_type"] == "explorer_started" for event in events) == 1
+    created = next(event for event in events if event["event_type"] == "context_inventory_created")
+    assert created["exploration_recommended"] is True
 
 
 def test_runner_inventory_failure_is_recorded_and_main_agent_continues(

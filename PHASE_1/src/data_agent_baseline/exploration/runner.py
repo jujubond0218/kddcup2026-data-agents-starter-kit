@@ -76,11 +76,25 @@ class JoinCandidate(_StrictInput):
     evidence_refs: list[str] = Field(min_length=1, max_length=8)
 
 
+class RecommendedCheck(_StrictInput):
+    check_type: Literal[
+        "source_relevance",
+        "field_semantics",
+        "join_coverage",
+        "filter_domain",
+    ]
+    paths: list[str] = Field(min_length=1, max_length=2)
+    fields: list[FieldReference] = Field(default_factory=list, max_length=4)
+    instruction: str = Field(min_length=1, max_length=300)
+    evidence_refs: list[str] = Field(min_length=1, max_length=8)
+
+
 class ExplorerReportInput(_StrictInput):
     selected_sources: list[EvidenceBackedSource] = Field(default_factory=list, max_length=8)
     evidence_refs: list[str] = Field(default_factory=list, max_length=16)
     key_fields: list[KeyField] = Field(default_factory=list, max_length=24)
     join_candidates: list[JoinCandidate] = Field(default_factory=list, max_length=12)
+    recommended_checks: list[RecommendedCheck] = Field(default_factory=list, max_length=8)
     etl_candidates: list[EvidenceBackedSource] = Field(default_factory=list, max_length=8)
     warnings: list[str] = Field(default_factory=list, max_length=12)
     uncertainties: list[str] = Field(default_factory=list, max_length=8)
@@ -132,7 +146,9 @@ files when more evidence is necessary. Every claim in report must cite evidence
 IDs returned in the initial evidence or preview observations. File and field
 relationships are candidates, never established facts. Call report no later than
 your final turn. Do not calculate the final answer, execute Python or SQL, invent
-paths, or include unsupported recommendations.
+paths, or include unsupported recommendations. Return concrete recommended_checks
+when the main agent still needs to validate source relevance, field semantics,
+join coverage, or a filter domain. Checks never contain executable code or SQL.
 """.strip()
 
 
@@ -229,6 +245,9 @@ class _ExplorerTools:
         for candidate in arguments.join_candidates:
             paths.add(candidate.left.path)
             paths.add(candidate.right.path)
+        for check in arguments.recommended_checks:
+            paths.update(check.paths)
+            paths.update(field.path for field in check.fields)
         return paths
 
     @staticmethod
@@ -240,9 +259,65 @@ class _ExplorerTools:
             refs.update(item.evidence_refs)
         for item in arguments.join_candidates:
             refs.update(item.evidence_refs)
+        for item in arguments.recommended_checks:
+            refs.update(item.evidence_refs)
         for item in arguments.etl_candidates:
             refs.update(item.evidence_refs)
         return refs
+
+    @staticmethod
+    def _summary_fields(summary: dict[str, Any]) -> set[tuple[str | None, str]]:
+        fields = {(None, str(column)) for column in summary.get("columns", [])}
+        fields.update((None, str(field)) for field in summary.get("field_paths", []))
+        fields.update((None, str(field)) for field in summary.get("keys", []))
+        for table in summary.get("tables", []):
+            table_name = str(table.get("name"))
+            fields.update(
+                (table_name, str(column.get("name")))
+                for column in table.get("columns", [])
+                if column.get("name") is not None
+            )
+        return fields
+
+    def _known_fields(self) -> dict[str, set[tuple[str | None, str]]]:
+        known: dict[str, set[tuple[str | None, str]]] = {}
+        for evidence in self.evidence.values():
+            path = evidence.get("path")
+            observation = evidence.get("observation")
+            if not isinstance(path, str) or not isinstance(observation, dict):
+                continue
+            summary = observation.get("summary")
+            if isinstance(summary, dict):
+                known.setdefault(path, set()).update(self._summary_fields(summary))
+        return known
+
+    @staticmethod
+    def _field_references(arguments: ExplorerReportInput) -> list[FieldReference]:
+        references = [
+            FieldReference(path=item.path, table=item.table, field=item.field)
+            for item in arguments.key_fields
+        ]
+        for candidate in arguments.join_candidates:
+            references.extend([candidate.left, candidate.right])
+        for check in arguments.recommended_checks:
+            references.extend(check.fields)
+        return references
+
+    def _unknown_field_references(
+        self,
+        arguments: ExplorerReportInput,
+    ) -> list[FieldReference]:
+        known = self._known_fields()
+        unknown = []
+        for reference in self._field_references(arguments):
+            available = known.get(reference.path, set())
+            exact = (reference.table, reference.field) in available
+            unqualified = reference.table is None and any(
+                field == reference.field for _, field in available
+            )
+            if not exact and not unqualified:
+                unknown.append(reference)
+        return unknown
 
     def report(self, _: PublicTask, arguments: ExplorerReportInput) -> ToolExecutionResult:
         unknown_paths = self._referenced_paths(arguments) - set(self.candidate_paths)
@@ -257,6 +332,20 @@ class _ExplorerTools:
             return _error_result(
                 "UNKNOWN_EVIDENCE_REF",
                 f"Report references unknown evidence IDs: {sorted(unknown_evidence)}",
+            )
+        unknown_fields = self._unknown_field_references(arguments)
+        if unknown_fields:
+            rendered_fields = [
+                {
+                    "path": reference.path,
+                    "table": reference.table,
+                    "field": reference.field,
+                }
+                for reference in unknown_fields
+            ]
+            return _error_result(
+                "UNKNOWN_FIELD_REF",
+                f"Report references fields absent from evidence: {rendered_fields}",
             )
         report = arguments.model_dump(mode="json")
         rendered = json.dumps(report, ensure_ascii=False, separators=(",", ":"))
@@ -292,6 +381,7 @@ class _ExplorerTools:
             "evidence_refs": all_refs,
             "key_fields": [],
             "join_candidates": [],
+            "recommended_checks": [],
             "etl_candidates": [],
             "warnings": [reason],
             "uncertainties": ["The Explorer did not submit a validated evidence-first report."],
@@ -314,7 +404,9 @@ class _ExplorerTools:
                     name="report",
                     description=(
                         "Submit the evidence-first Explorer report and finish. Every claim must "
-                        "reference an evidence_id already supplied by inventory or preview_file."
+                        "reference an evidence_id already supplied by inventory or preview_file. "
+                        "Use recommended_checks for bounded validations the main agent should "
+                        "perform; never include executable code or SQL."
                     ),
                     input_model=ExplorerReportInput,
                     handler=self.report,
@@ -497,6 +589,15 @@ class ExplorerToolHandler:
     _results: dict[tuple[str, str, tuple[str, ...]], ExplorerResult] = field(default_factory=dict)
 
     def __call__(self, task: PublicTask, request: ExploreInput) -> ToolExecutionResult:
+        exploration = self.inventory.get("exploration")
+        if isinstance(exploration, dict) and exploration.get("recommended") is True:
+            expected_focus = exploration.get("focus")
+            expected_paths = exploration.get("candidate_paths")
+            if request.focus != expected_focus or request.candidate_paths != expected_paths:
+                return _error_result(
+                    "EXPLORATION_REQUEST_MISMATCH",
+                    "Use exploration.focus and exploration.candidate_paths exactly as supplied.",
+                )
         available_paths = set(_inventory_entries(self.inventory))
         unknown_paths = set(request.candidate_paths) - available_paths
         if unknown_paths:
