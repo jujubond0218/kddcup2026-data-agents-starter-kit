@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from typing import Any
 
 from data_agent_baseline.agents.model import (
     ModelAdapter,
@@ -82,6 +83,7 @@ class ReActAgent:
         system_prompt: str | None = None,
         event_sink: EventSink | None = None,
         answer_verifier: AnswerVerifier | None = None,
+        context_inventory: dict[str, Any] | None = None,
     ) -> None:
         self.model = model
         self.tools = tools
@@ -89,14 +91,24 @@ class ReActAgent:
         self.system_prompt = system_prompt or REACT_SYSTEM_PROMPT
         self.event_sink = event_sink
         self.answer_verifier = answer_verifier or AnswerVerifier()
+        self.context_inventory = context_inventory
 
     def _initial_messages(self, task: PublicTask) -> list[ModelMessage]:
         return [
             ModelMessage(
                 role="system",
-                content=build_system_prompt(system_prompt=self.system_prompt),
+                content=build_system_prompt(
+                    system_prompt=self.system_prompt,
+                    explore_available="explore" in self.tools.specs,
+                ),
             ),
-            ModelMessage(role="user", content=build_task_prompt(task)),
+            ModelMessage(
+                role="user",
+                content=build_task_prompt(
+                    task,
+                    context_inventory=self.context_inventory,
+                ),
+            ),
         ]
 
     def _record_protocol_error(

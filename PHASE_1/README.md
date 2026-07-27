@@ -88,7 +88,7 @@ agent:
   model: YOUR_MODEL_NAME
   api_base: YOUR_API_BASE_URL
   api_key: YOUR_API_KEY
-  max_steps: 16
+  max_steps: 20
   temperature: 0.0
   model_request_timeout_seconds: 20
   model_max_retries: 1
@@ -99,6 +99,16 @@ run:
   run_id:
   max_workers: 2
   task_timeout_seconds: 120
+
+explorer:
+  enabled: true
+  max_steps: 3
+  max_files: 64
+  max_preview_calls: 2
+  max_preview_chars: 2000
+  max_inventory_chars: 12000
+  max_prompt_inventory_chars: 6000
+  max_report_chars: 4000
 ```
 
 Config fields:
@@ -118,6 +128,9 @@ Config fields:
 | `run.run_id` | Optional run directory name. Defaults to a UTC timestamp if omitted. Required by `--resume`. |
 | `run.max_workers` | Parallel worker count for `run-benchmark`. |
 | `run.task_timeout_seconds` | Maximum wall-clock time per task. Set to `0` or a negative value to disable the task-level timeout. |
+| `explorer.enabled` | Injects a bounded deterministic Context Inventory and enables the optional focused `explore` tool. |
+| `explorer.max_steps` | Maximum native tool-calling steps available to one focused Explorer run. |
+| `explorer.max_prompt_inventory_chars` | Maximum serialized Inventory characters injected before the first model request. |
 
 ## CLI
 
@@ -177,6 +190,7 @@ The baseline exposes these tools to the model:
 | Tool | Purpose | Inputs |
 | --- | --- | --- |
 | `list_context` | List files and directories under `context/`. | `max_depth` |
+| `explore` | Resolve a specific ambiguity over Inventory-selected files with a bounded evidence-first sub-agent. | `focus`, `candidate_paths` |
 | `read_csv` | Read a CSV preview. | `path`, `max_rows` |
 | `read_json` | Read a JSON preview. | `path`, `max_chars` |
 | `read_doc` | Read a text document preview. | `path`, `max_chars` |
@@ -238,6 +252,8 @@ results are recorded in
 [`docs/2026-07-24-native-tool-calling.md`](docs/2026-07-24-native-tool-calling.md).
 The deterministic pre-submit checks and correction flow are documented in
 [`docs/2026-07-24-answer-verification.md`](docs/2026-07-24-answer-verification.md).
+The bounded Explorer design, limits, fallback behavior, and evaluation boundaries are recorded in
+[`docs/2026-07-27-context-explorer.md`](docs/2026-07-27-context-explorer.md).
 
 ## Contact
 
@@ -294,6 +310,7 @@ The deterministic pre-submit checks and correction flow are documented in
 | `src/data_agent_baseline/tools/sqlite.py` | `inspect_sqlite_schema`, `execute_context_sql` |
 | `src/data_agent_baseline/tools/contracts.py` | Pydantic input contracts for native tools |
 | `src/data_agent_baseline/tools/registry.py` | JSON Schema generation, validation, dispatch, and terminal `answer` |
+| `src/data_agent_baseline/exploration/` | Bounded Explorer sub-agent and deterministic context inventory |
 | `src/data_agent_baseline/agents/model.py` | OpenAI-compatible messages and native `tool_calls` adapter |
 | `src/data_agent_baseline/agents/prompt.py` | System and task prompts |
 | `src/data_agent_baseline/agents/react.py` | Native tool-calling ReAct runtime |

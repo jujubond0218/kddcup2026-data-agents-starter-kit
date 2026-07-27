@@ -5,7 +5,7 @@ agent:
   model: YOUR_MODEL_NAME
   api_base: YOUR_API_BASE_URL
   api_key: YOUR_API_KEY
-  max_steps: 16
+  max_steps: 20
   temperature: 0.0
   model_request_timeout_seconds: 20
   model_max_retries: 1
@@ -16,3 +16,17 @@ run:
   run_id: example_run_id
   max_workers: 2
   task_timeout_seconds: 120
+
+explorer:
+  enabled: true
+  max_steps: 3
+  max_files: 64
+  max_preview_calls: 2
+  max_preview_chars: 2000
+  max_inventory_chars: 12000
+  max_prompt_inventory_chars: 6000
+  max_report_chars: 4000
+  max_total_read_bytes: 4194304
+  max_single_file_bytes: 262144
+  max_pdf_bytes: 2097152
+  max_pdf_pages: 3

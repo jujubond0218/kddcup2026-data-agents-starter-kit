@@ -88,7 +88,7 @@ agent:
   model: YOUR_MODEL_NAME
   api_base: YOUR_API_BASE_URL
   api_key: YOUR_API_KEY
-  max_steps: 16
+  max_steps: 20
   temperature: 0.0
   model_request_timeout_seconds: 20
   model_max_retries: 1
@@ -99,6 +99,16 @@ run:
   run_id:
   max_workers: 2
   task_timeout_seconds: 120
+
+explorer:
+  enabled: true
+  max_steps: 3
+  max_files: 64
+  max_preview_calls: 2
+  max_preview_chars: 2000
+  max_inventory_chars: 12000
+  max_prompt_inventory_chars: 6000
+  max_report_chars: 4000
 ```
 
 配置字段说明：
@@ -118,6 +128,9 @@ run:
 | `run.run_id` | 可选，指定运行目录名。不传时默认使用 UTC 时间戳；使用 `--resume` 时必须填写。 |
 | `run.max_workers` | `run-benchmark` 并行 worker 数。 |
 | `run.task_timeout_seconds` | 单个任务允许的最长墙钟时间。设为 `0` 或负数可关闭任务级超时。 |
+| `explorer.enabled` | 是否注入受预算的确定性 Context Inventory，并启用可选定向 `explore` 工具。 |
+| `explorer.max_steps` | 单次定向 Explorer 最多可使用的原生工具调用步数。 |
+| `explorer.max_prompt_inventory_chars` | 首次模型请求前注入的序列化 Inventory 最大字符数。 |
 
 ## CLI
 
@@ -175,6 +188,7 @@ OpenAI-compatible Chat Completions 接口。
 | 工具 | 作用 | 输入 |
 | --- | --- | --- |
 | `list_context` | 列出 `context/` 下的文件和目录。 | `max_depth` |
+| `explore` | 对 Inventory 中选定文件的具体歧义运行受限 evidence-first 子 Agent。 | `focus`、`candidate_paths` |
 | `read_csv` | 读取 CSV 预览。 | `path`、`max_rows` |
 | `read_json` | 读取 JSON 预览。 | `path`、`max_chars` |
 | `read_doc` | 读取文本文档预览。 | `path`、`max_chars` |
@@ -233,6 +247,8 @@ uv run dabench score-run artifacts/runs/<run_id> \
 [`docs/2026-07-24-native-tool-calling.md`](docs/2026-07-24-native-tool-calling.md)。
 确定性的提交前校验和纠错流程见
 [`docs/2026-07-24-answer-verification.md`](docs/2026-07-24-answer-verification.md)。
+受限 Explorer 的设计、预算、失败回退和评测边界见
+[`docs/2026-07-27-context-explorer.md`](docs/2026-07-27-context-explorer.md)。
 
 ## Contact
 
@@ -289,6 +305,7 @@ uv run dabench score-run artifacts/runs/<run_id> \
 | `src/data_agent_baseline/tools/sqlite.py` | `inspect_sqlite_schema`、`execute_context_sql` |
 | `src/data_agent_baseline/tools/contracts.py` | 原生工具的 Pydantic 输入契约 |
 | `src/data_agent_baseline/tools/registry.py` | JSON Schema 生成、校验、分发与终止型 `answer` |
+| `src/data_agent_baseline/exploration/` | 受限 Explorer 子 Agent 与确定性上下文清单 |
 | `src/data_agent_baseline/agents/model.py` | OpenAI-compatible 消息与原生 `tool_calls` Adapter |
 | `src/data_agent_baseline/agents/prompt.py` | system prompt 与 task prompt |
 | `src/data_agent_baseline/agents/react.py` | 原生工具调用 ReAct runtime |

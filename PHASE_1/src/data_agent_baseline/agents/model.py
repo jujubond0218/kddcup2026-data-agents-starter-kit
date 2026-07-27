@@ -55,6 +55,7 @@ class ModelResponse:
     tool_calls: tuple[ModelToolCall, ...]
     raw_response: str
     finish_reason: str | None = None
+    usage: dict[str, int] | None = None
 
 
 class ToolSchemaSource(Protocol):
@@ -78,6 +79,7 @@ def _serialize_response(
     content: str,
     tool_calls: tuple[ModelToolCall, ...],
     finish_reason: str | None,
+    usage: dict[str, int] | None,
 ) -> str:
     return json.dumps(
         {
@@ -85,6 +87,7 @@ def _serialize_response(
             "content": content,
             "tool_calls": [call.to_openai_dict() for call in tool_calls],
             "finish_reason": finish_reason,
+            "usage": usage,
         },
         ensure_ascii=False,
         separators=(",", ":"),
@@ -194,6 +197,16 @@ class OpenAIModelAdapter:
         tool_calls = tuple(parsed_calls)
         finish_reason_value = getattr(choice, "finish_reason", None)
         finish_reason = str(finish_reason_value) if finish_reason_value is not None else None
+        raw_usage = getattr(response, "usage", None)
+        usage: dict[str, int] | None = None
+        if raw_usage is not None:
+            parsed_usage = {
+                "prompt_tokens": getattr(raw_usage, "prompt_tokens", None),
+                "completion_tokens": getattr(raw_usage, "completion_tokens", None),
+                "total_tokens": getattr(raw_usage, "total_tokens", None),
+            }
+            if all(isinstance(value, int) for value in parsed_usage.values()):
+                usage = {key: int(value) for key, value in parsed_usage.items()}
         return ModelResponse(
             content=content,
             tool_calls=tool_calls,
@@ -201,8 +214,10 @@ class OpenAIModelAdapter:
                 content=content,
                 tool_calls=tool_calls,
                 finish_reason=finish_reason,
+                usage=usage,
             ),
             finish_reason=finish_reason,
+            usage=usage,
         )
 
     def complete(
@@ -292,6 +307,7 @@ class OpenAIModelAdapter:
                     "elapsed_seconds": round(time.perf_counter() - started_at, 3),
                     "finish_reason": response.finish_reason,
                     "tool_call_count": len(response.tool_calls),
+                    "usage": response.usage,
                 },
             )
             return response

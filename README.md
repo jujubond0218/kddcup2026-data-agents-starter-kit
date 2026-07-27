@@ -78,6 +78,7 @@ uv.lock                           # Locked dependency versions
 - [2026-07-24: Phase 1 Runner Reliability](PHASE_1/docs/2026-07-24-runner-reliability.md)
 - [2026-07-24: Phase 1 Native Tool Calling](PHASE_1/docs/2026-07-24-native-tool-calling.md)
 - [2026-07-24: Phase 1 Deterministic Answer Verification](PHASE_1/docs/2026-07-24-answer-verification.md)
+- [2026-07-27: Phase 1 Bounded Context Explorer](PHASE_1/docs/2026-07-27-context-explorer.md)
 
 ## Contact
 
