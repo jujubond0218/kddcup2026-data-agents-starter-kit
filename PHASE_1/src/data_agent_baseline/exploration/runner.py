@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from time import monotonic
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from data_agent_baseline.agents.model import (
     ModelAdapter,
@@ -30,27 +30,64 @@ class _StrictInput(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
 
-class ExploreInput(_StrictInput):
+class _EmptyInput(_StrictInput):
+    @model_validator(mode="before")
+    @classmethod
+    def _discard_placeholder_properties(cls, value: Any) -> Any:
+        # Some OpenAI-compatible models serialize an empty argument object as
+        # {"{}": {}} or invent example placeholders even though the advertised
+        # schema has no properties. These values cannot influence an argument-free
+        # tool, so normalize only object-shaped payloads at this narrow boundary.
+        return {} if isinstance(value, dict) else value
+
+
+class ExploreInput(_EmptyInput):
     pass
 
 
-class InspectFilesInput(_StrictInput):
+class InspectFilesInput(_EmptyInput):
     pass
 
 
 class PreviewFileInput(_StrictInput):
-    path: str = Field(min_length=1, max_length=500)
+    path: str = Field(
+        min_length=1,
+        max_length=500,
+        description="One exact relative file path returned by inspect_files.",
+    )
 
 
 class GrepContextInput(_StrictInput):
-    pattern: str = Field(min_length=1, max_length=200)
-    path: str | None = Field(default=None, min_length=1, max_length=500)
+    pattern: str = Field(
+        min_length=1,
+        max_length=200,
+        description="Case-insensitive regular expression used only to locate evidence.",
+    )
+    path: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=500,
+        description="Optional exact inspected file path or inspected directory prefix.",
+    )
 
 
 class ExplorerSqlInput(_StrictInput):
-    path: str = Field(min_length=1, max_length=500)
-    sql: str = Field(min_length=1, max_length=4_000)
-    limit: int = Field(default=200, ge=1, le=200)
+    path: str = Field(
+        min_length=1,
+        max_length=500,
+        description="An inspected .db, .sqlite, or .sqlite3 file; never a CSV or document.",
+    )
+    sql: str = Field(
+        min_length=1,
+        max_length=4_000,
+        description="One read-only SELECT, WITH, PRAGMA, or EXPLAIN discovery statement.",
+    )
+    limit: int = Field(
+        default=200,
+        ge=1,
+        le=200,
+        description="Maximum rows returned by this discovery query.",
+    )
 
 
 class EvidenceFile(_StrictInput):
@@ -662,57 +699,68 @@ class _ExplorerTools:
                 report["files"].pop()
         return report, list(self.evidence.values())
 
-    def registry(self) -> ToolRegistry:
-        return ToolRegistry(
-            specs={
-                "execute_context_sql": ToolSpec(
-                    name="execute_context_sql",
-                    description=(
-                        "Run bounded read-only SELECT, WITH, PRAGMA, or EXPLAIN SQL against an "
-                        "inspected SQLite file. Never compute the final answer."
-                    ),
-                    input_model=ExplorerSqlInput,
-                    handler=self.sql,
+    def registry(self, *, final_step: bool = False) -> ToolRegistry:
+        specs = {
+            "execute_context_sql": ToolSpec(
+                name="execute_context_sql",
+                description=(
+                    "Run bounded read-only SELECT, WITH, PRAGMA, or EXPLAIN SQL against an "
+                    "inspected SQLite file. Never compute the final answer."
                 ),
-                "grep_context": ToolSpec(
-                    name="grep_context",
-                    description=(
-                        "Search a bounded case-insensitive regex across inspected Phase 1 text "
-                        "and SQLite sources. Use only to locate evidence, not aggregate data."
-                    ),
-                    input_model=GrepContextInput,
-                    handler=self.grep,
+                input_model=ExplorerSqlInput,
+                handler=self.sql,
+            ),
+            "grep_context": ToolSpec(
+                name="grep_context",
+                description=(
+                    "Search a bounded case-insensitive regex across inspected Phase 1 text "
+                    "and SQLite sources. Use only to locate evidence, not aggregate data."
                 ),
-                "inspect_files": ToolSpec(
-                    name="inspect_files",
-                    description=(
-                        "Use first and alone to build a bounded map of every Phase 1 context "
-                        "file, schema, warning, and candidate relationship."
-                    ),
-                    input_model=InspectFilesInput,
-                    handler=self.inspect,
+                input_model=GrepContextInput,
+                handler=self.grep,
+            ),
+            "inspect_files": ToolSpec(
+                name="inspect_files",
+                description=(
+                    "Use first and alone to build a bounded map of every Phase 1 context "
+                    "file, schema, warning, and candidate relationship."
                 ),
-                "preview_file": ToolSpec(
-                    name="preview_file",
-                    description=(
-                        "Preview one path returned by inspect_files and receive immutable "
-                        "evidence. Every knowledge.md must be previewed before report."
-                    ),
-                    input_model=PreviewFileInput,
-                    handler=self.preview,
+                input_model=InspectFilesInput,
+                handler=self.inspect,
+            ),
+            "preview_file": ToolSpec(
+                name="preview_file",
+                description=(
+                    "Preview one path returned by inspect_files and receive immutable "
+                    "evidence. Every knowledge.md must be previewed before report."
                 ),
-                "report": ToolSpec(
-                    name="report",
-                    description=(
-                        "Submit the evidence-backed data map and finish. Must be the only call "
-                        "in its turn; joins and ETL entries remain advisory candidates."
-                    ),
-                    input_model=ExplorerReportInput,
-                    handler=self.report,
-                    is_terminal=True,
+                input_model=PreviewFileInput,
+                handler=self.preview,
+            ),
+            "report": ToolSpec(
+                name="report",
+                description=(
+                    "Submit the evidence-backed data map and finish. Must be the only call "
+                    "in its turn; joins and ETL entries remain advisory candidates."
                 ),
-            }
-        )
+                input_model=ExplorerReportInput,
+                handler=self.report,
+                is_terminal=True,
+            ),
+        }
+        if not self.inspect_completed:
+            return ToolRegistry(specs={"inspect_files": specs["inspect_files"]})
+        specs.pop("inspect_files")
+        if not any(
+            path.casefold().endswith((".db", ".sqlite", ".sqlite3"))
+            for path in self.discovered_paths
+        ):
+            specs.pop("execute_context_sql")
+        if self.preview_calls >= self.config.max_preview_calls:
+            specs.pop("preview_file")
+        if final_step:
+            return ToolRegistry(specs={"report": specs["report"]})
+        return ToolRegistry(specs=specs)
 
 
 class ExplorerRunner:
@@ -764,7 +812,6 @@ class ExplorerRunner:
 
     def run(self, task: PublicTask, _: ExploreInput) -> ExplorerResult:
         tools = _ExplorerTools(config=self.config, event_sink=self.event_sink)
-        registry = tools.registry()
         messages = [
             ModelMessage(role="system", content=EXPLORER_SYSTEM_PROMPT),
             ModelMessage(
@@ -792,6 +839,7 @@ class ExplorerRunner:
                     reason="Explorer exceeded its soft time budget.",
                     reason_code="SOFT_TIMEOUT",
                 )
+            registry = tools.registry(final_step=step_index == self.config.max_steps)
             try:
                 response = self.model.complete(
                     messages,

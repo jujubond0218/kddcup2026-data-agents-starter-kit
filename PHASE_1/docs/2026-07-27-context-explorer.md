@@ -32,7 +32,11 @@ inspect/preview/grep/SQL evidence ID；所有连接始终标记为 candidate。`
 Explorer 默认最多 10 个模型轮次，软墙钟上限为 60 秒；10 轮是复杂任务的硬上限，不是
 期望平均值。`inspect_files` 与 `report` 必须各自独占一轮；中间轮次最多包含两个独立
 发现工具调用，运行时按原顺序执行，并为每个调用返回匹配原始 `tool_call_id` 的独立
-observation。主 Agent 的“一轮一个工具”协议不变。
+observation。子 Agent 每轮只看到当前阶段合法的工具：首轮只有 `inspect_files`，没有
+SQLite 来源时不暴露 SQL，最后一轮只有 `report`。`explore` 和 `inspect_files` 的公开
+schema 仍为空对象；对于部分 OpenAI-compatible 模型为无参数工具生成的无意义占位字段，
+运行时仅在这两个空输入边界丢弃字段，避免参数形状错误阻止 fail-open。主 Agent 的
+“一轮一个工具”协议不变。
 
 扫描默认最多处理 64 个文件、总读取 4 MiB、普通单文件 256 KiB，文本型 PDF 最多读取
 2 MiB 和前三页；inspect 结果最多 12,000 字符，单个 preview 最多 2,000 字符，正常报告

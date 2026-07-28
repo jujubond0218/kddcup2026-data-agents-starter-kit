@@ -161,6 +161,9 @@ def test_explorer_inspects_then_reads_knowledge_and_supports_two_calls_per_turn(
         "preview:1",
         "preview:2",
     }
+    assert model.requested_tool_names[0] == ("inspect_files",)
+    assert "execute_context_sql" not in model.requested_tool_names[1]
+    assert "inspect_files" not in model.requested_tool_names[1]
     assert model.requests[2][-2].tool_call_id == "knowledge_preview"
     assert model.requests[2][-1].tool_call_id == "sales_preview"
     assert any(kind == "explorer_knowledge_reviewed" for kind, _ in events)
@@ -567,8 +570,12 @@ def test_main_agent_calls_no_argument_explore_once_then_restores_tools(tmp_path)
     task = _task(tmp_path)
     model = ScriptedModelAdapter(
         [
-            _single_response("explore", {}, "main_explore"),
-            _single_response("inspect_files", {}, "inspect"),
+            _single_response("explore", {"{}": {}}, "main_explore"),
+            _single_response(
+                "inspect_files",
+                {"example_parameter_1": "ignored"},
+                "inspect",
+            ),
             _single_response("report", _report(), "report"),
             _single_response("explore", {}, "repeated_explore"),
             _single_response(
@@ -593,6 +600,8 @@ def test_main_agent_calls_no_argument_explore_once_then_restores_tools(tmp_path)
     assert result.steps[0].tool_call_id == "main_explore"
     assert result.steps[1].observation["content"]["error"]["code"] == "UNKNOWN_TOOL"
     assert model.requested_tool_names[0] == ("explore",)
+    assert model.requested_tool_names[1] == ("inspect_files",)
+    assert model.requested_tool_names[2] == ("report",)
     assert "explore" not in model.requested_tool_names[3]
     assert model.requests[3][-1].tool_call_id == "main_explore"
 
