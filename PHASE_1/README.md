@@ -129,7 +129,7 @@ Config fields:
 | `run.max_workers` | Parallel worker count for `run-benchmark`. |
 | `run.task_timeout_seconds` | Maximum wall-clock time per task. Set to `0` or a negative value to disable the task-level timeout. |
 | `explorer.enabled` | Exposes one argument-free `explore({})` call on the main Agent's first turn. The Explorer builds the file map; no Inventory is injected before the call. |
-| `explorer.max_steps` | Hard limit on Explorer model turns. The Explorer may execute up to two independent discovery tools in one turn. |
+| `explorer.max_steps` | Hard limit on Explorer model turns. Inspect, requirement locking, and report each occupy a standalone turn; other turns may execute up to two independent discovery tools. |
 | `explorer.max_duration_seconds` | Explorer soft wall-clock limit. On expiry, successful evidence is converted into a bounded fallback data map before the task-level hard timeout. |
 
 ## CLI
@@ -188,9 +188,10 @@ uv run dabench run-benchmark \
 Tools are advertised through the OpenAI-compatible native `tools` field. The main Agent returns
 one `tool_call` per turn, the registry validates its JSON arguments with Pydantic before
 execution, and the result is returned as a `tool` message with the matching `tool_call_id`.
-The Explorer is the only scoped exception: after its required standalone `inspect_files({})`
-turn, it may return up to two independent discovery calls in one turn; each receives a separate
-tool observation with its original call ID.
+The Explorer is the only scoped exception: after standalone `inspect_files({})`, it must use a
+standalone `lock_requirements` turn to freeze the question requirements and real candidate
+sources/fields. It may then return up to two independent targeted discovery calls in one turn;
+each receives a separate tool observation with its original call ID.
 An `answer` call must also pass deterministic CSV-safety verification before it can terminate
 the task; rejected candidates receive a recoverable tool observation for correction.
 The same Chat Completions flow works with Alibaba Cloud Model Studio's OpenAI-compatible
@@ -201,7 +202,7 @@ The baseline exposes these tools to the model:
 | Tool | Purpose | Inputs |
 | --- | --- | --- |
 | `list_context` | List files and directories under `context/`. | `max_depth` |
-| `explore` | Launch one bounded Phase 1 discovery sub-agent. It inspects files, explicitly previews every `knowledge.md`, and may use bounded preview, grep, and read-only SQL. Deep calls must bind to task requirements, and the runtime projects only report-selected relevant evidence. It is removed after the call even on fail-open. | none (`{}`) |
+| `explore` | Launch one bounded Phase 1 discovery sub-agent. It inspects files, locks the question to candidate paths and fields that actually exist in the Inventory, explicitly previews every `knowledge.md`, and may use bounded preview, grep, and read-only SQL. Deep calls cannot leave the locked plan. It is removed after the call even on fail-open. | none (`{}`) |
 | `read_csv` | Read a CSV preview. | `path`, `max_rows` |
 | `read_json` | Read a JSON preview. | `path`, `max_chars` |
 | `read_doc` | Read a text document preview. | `path`, `max_chars` |
@@ -211,15 +212,15 @@ The baseline exposes these tools to the model:
 | `answer` | Submit the final answer table and terminate the task. | `columns`, `rows` |
 
 All file paths passed to tools must be relative to the task `context/` directory.
-Inside `explore`, the child registry is limited to `inspect_files`, `preview_file`,
-`grep_context`, bounded read-only `execute_context_sql`, and terminal `report`. These child
-tools are never exposed to the main Agent at the same time as its normal computation tools.
-The runtime reminds the child to converge at 70% and 90% of its turn budget. The final turn
-accepts only `report`, with up to two corrective retries that do not consume additional
-Explorer steps. Normal reports retain a compact all-file background map but do not
-automatically inject unselected preview, grep, SQL observations, or weak relationship
-candidates. If no valid report is produced, fallback uses the requirement IDs and purposes
-recorded by deep tool calls to select at most eight higher-priority evidence items.
+Inside `explore`, the child registry is limited to `inspect_files`, `lock_requirements`,
+`preview_file`, `grep_context`, bounded read-only `execute_context_sql`, and terminal `report`.
+The locked plan is immutable. Every deep call must bind to real candidate paths and fields, with
+at most three calls per requirement; once all required or ambiguous fields have evidence, only
+`report` remains available. The runtime still issues 70% and 90% convergence reminders and
+allows up to two free corrective final retries. The model submits only relevant evidence,
+requirement resolutions, and other semantic increments; the runtime merges the file list,
+schemas, locked requirements, and evidence provenance. If no valid report is produced, fallback
+reuses the locked plan and selects at most eight higher-priority evidence items.
 
 ## Outputs
 

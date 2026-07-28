@@ -50,6 +50,63 @@ class InspectFilesInput(_EmptyInput):
     pass
 
 
+class CandidateField(_StrictInput):
+    path: str = Field(min_length=1, max_length=500)
+    field: str = Field(min_length=1, max_length=200)
+    table: str | None = Field(default=None, max_length=200)
+
+
+class LockedRequirement(_StrictInput):
+    id: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    kind: Literal[
+        "entity",
+        "measure",
+        "filter",
+        "time_scope",
+        "output",
+        "knowledge",
+        "join",
+        "other",
+    ]
+    description: str = Field(min_length=1, max_length=300)
+    candidate_paths: list[str] = Field(min_length=1, max_length=8)
+    candidate_fields: list[CandidateField] = Field(default_factory=list, max_length=8)
+    search_terms: list[str] = Field(default_factory=list, max_length=8)
+    needs_discovery: bool = False
+
+    @field_validator("candidate_paths", "search_terms")
+    @classmethod
+    def _validate_unique_strings(cls, values: list[str]) -> list[str]:
+        if len(values) != len(set(values)):
+            raise ValueError("Values must be unique.")
+        if any(not value or len(value) > 500 for value in values):
+            raise ValueError("Candidate paths and search terms must contain 1-500 characters.")
+        return values
+
+    @field_validator("candidate_fields")
+    @classmethod
+    def _validate_unique_fields(cls, values: list[CandidateField]) -> list[CandidateField]:
+        identities = {(item.path, item.table, item.field) for item in values}
+        if len(values) != len(identities):
+            raise ValueError("candidate_fields must be unique.")
+        return values
+
+
+class LockRequirementsInput(_StrictInput):
+    requirements: list[LockedRequirement] = Field(min_length=1, max_length=12)
+
+    @field_validator("requirements")
+    @classmethod
+    def _validate_unique_requirements(
+        cls,
+        values: list[LockedRequirement],
+    ) -> list[LockedRequirement]:
+        identifiers = [item.id for item in values]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("requirement IDs must be unique.")
+        return values
+
+
 class _TargetedDiscoveryInput(_StrictInput):
     requirement_ids: list[str] = Field(
         min_length=1,
@@ -63,6 +120,11 @@ class _TargetedDiscoveryInput(_StrictInput):
         min_length=1,
         max_length=300,
         description="Why this call is necessary for the task question.",
+    )
+    target_fields: list[CandidateField] = Field(
+        default_factory=list,
+        max_length=8,
+        description="Locked candidate fields this call will inspect or disambiguate.",
     )
 
     @field_validator("requirement_ids")
@@ -89,11 +151,10 @@ class GrepContextInput(_TargetedDiscoveryInput):
         max_length=200,
         description="Case-insensitive regular expression used only to locate evidence.",
     )
-    path: str | None = Field(
-        default=None,
+    path: str = Field(
         min_length=1,
         max_length=500,
-        description="Optional exact inspected file path or inspected directory prefix.",
+        description="One exact candidate path declared by lock_requirements.",
     )
 
 
@@ -164,29 +225,25 @@ class EvidenceWarning(_StrictInput):
     evidence_refs: list[str] = Field(min_length=1, max_length=8)
 
 
-class TaskRequirement(_StrictInput):
-    id: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
-    kind: Literal[
-        "entity",
-        "measure",
-        "filter",
-        "time_scope",
-        "output",
-        "knowledge",
-        "join",
-        "other",
-    ]
-    description: str = Field(min_length=1, max_length=300)
-
-
 class RelevantEvidence(_StrictInput):
     evidence_id: str = Field(min_length=1, max_length=100)
     supports: list[str] = Field(min_length=1, max_length=4)
 
 
+class RequirementResolution(_StrictInput):
+    requirement_id: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    status: Literal["resolved", "unresolved"]
+    selected_field: CandidateField | None = None
+    rejected_fields: list[CandidateField] = Field(default_factory=list, max_length=8)
+    evidence_refs: list[str] = Field(default_factory=list, max_length=8)
+    note: str | None = Field(default=None, max_length=300)
+
+
 class ExplorerReportInput(_StrictInput):
-    task_requirements: list[TaskRequirement] = Field(default_factory=list, max_length=12)
     relevant_evidence: list[RelevantEvidence] = Field(default_factory=list, max_length=24)
+    requirement_resolutions: list[RequirementResolution] = Field(
+        default_factory=list, max_length=12
+    )
     selected_sources: list[str] = Field(default_factory=list, max_length=16)
     field_semantics: list[FieldSemantic] = Field(default_factory=list, max_length=32)
     knowledge: list[KnowledgeEntry] = Field(default_factory=list, max_length=24)
@@ -238,27 +295,39 @@ data landscape and never calculate the final answer.
 
 Workflow:
 1. Your first successful turn must call inspect_files({}) and no other tool.
-2. After inspect_files, decompose the question into stable lowercase requirement
-   IDs for entities, measures, filters, time scope, output fields, knowledge, or
-   joins. Every preview_file, grep_context, and execute_context_sql call must state
-   the requirement_ids it supports and a concise purpose.
-3. If inspect_files lists knowledge.md (case-insensitive), you must call
+2. Your second successful turn must call lock_requirements alone. Decompose the
+   question into stable requirements for entities, measures, filters, time scope,
+   output fields, knowledge, and joins. For each requirement, name only candidate
+   paths and fields that inspect_files actually returned. Mark needs_discovery=true
+   only when inspect evidence is insufficient. Multiple candidate_fields mean an
+   explicit ambiguity that must be checked, not a guessed relationship. Derive
+   requirements and search_terms only from the question. For a question phrase
+   that can map to several real fields, lock every plausible field; do not add a
+   field merely because its name is similar.
+3. After locking, every preview_file, grep_context, and execute_context_sql call
+   must cite locked requirement_ids, candidate target_fields, and a concise purpose.
+   Do not explore a path or field outside the locked plan. If inspect_files lists
+   knowledge.md (case-insensitive), include it in a knowledge requirement and call
    preview_file for every listed knowledge.md before report.
 4. Use at most two independent tools in one turn. Targeted preview_file,
    grep_context, and read-only execute_context_sql calls may share a turn.
-5. Turn 3 and later should call report unless a required rule, source, table, or
-   field is still unknown. Once every required field is located, stop exploring.
-   Do not cross-check the same field in extra sources.
+5. The runtime tracks coverage of the immutable requirements and exposes report
+   as soon as every needs_discovery requirement has relevant evidence. Resolve
+   schema ambiguity by comparing candidate values, value ambiguity with exact
+   observed categories and knowledge rules, and numeric references with observed
+   ranges. Leave vague semantics unresolved when evidence cannot decide. Do not
+   cross-check already covered requirements in extra sources.
 6. report must be the only tool call in its turn and is the only normal way to
    finish. An incomplete semantic report is better than no report.
 
 The runtime always preserves a compact background inventory, but it includes deep
 preview/grep/SQL observations only when report.relevant_evidence selects them and
-binds them to declared task_requirements. Do not select evidence merely because
-it was collected. Submit task_requirements, relevant_evidence, selected_sources,
+binds them to locked requirements. Do not select evidence merely because it was
+collected. Submit relevant_evidence, requirement_resolutions, selected_sources,
 field_semantics, knowledge rules, advisory etl_candidates, candidate join_paths,
-objective warnings, and uncertainties. Every semantic claim must cite selected
-immutable evidence IDs returned by tools.
+objective warnings, and uncertainties. The runtime owns the requirements, file
+inventory, schemas, and evidence provenance. Every semantic claim must cite
+selected immutable evidence IDs returned by tools.
 Observed data wins on conflict. Do not execute Python, write SQL, create indexes,
 perform ETL, give computation advice, or inspect anything outside context/.
 """.strip()
@@ -300,11 +369,14 @@ def _summary_fields(summary: dict[str, Any]) -> set[tuple[str | None, str]]:
 
 
 class _ExplorerTools:
+    _MAX_DISCOVERY_CALLS_PER_REQUIREMENT = 3
+
     def __init__(self, *, config: ExplorerConfig, event_sink: EventSink | None = None) -> None:
         self.config = config
         self.event_sink = event_sink
         self.inspect_attempted = False
         self.inspect_completed = False
+        self.requirements_locked = False
         self.preview_calls = 0
         self.grep_calls = 0
         self.sql_calls = 0
@@ -312,6 +384,8 @@ class _ExplorerTools:
         self.knowledge_paths: set[str] = set()
         self.knowledge_attempted: set[str] = set()
         self.knowledge_failures: set[str] = set()
+        self.locked_requirements: dict[str, LockedRequirement] = {}
+        self.requirement_call_counts: dict[str, int] = {}
         self.evidence: dict[str, dict[str, Any]] = {}
 
     def _add_evidence(
@@ -323,6 +397,7 @@ class _ExplorerTools:
         path: str | None = None,
         requirement_ids: list[str] | None = None,
         purpose: str | None = None,
+        target_fields: list[CandidateField] | None = None,
         ok: bool = True,
     ) -> dict[str, Any]:
         evidence_id = f"{prefix}:{sum(key.startswith(f'{prefix}:') for key in self.evidence) + 1}"
@@ -333,6 +408,7 @@ class _ExplorerTools:
             "observation": observation,
             "requirement_ids": list(requirement_ids or []),
             "purpose": purpose,
+            "target_fields": [item.model_dump(mode="json") for item in (target_fields or [])],
             "ok": ok,
         }
         self.evidence[evidence_id] = evidence
@@ -388,6 +464,185 @@ class _ExplorerTools:
             return None
         return _error_result("INSPECT_REQUIRED", "Call inspect_files({}) successfully first.")
 
+    @staticmethod
+    def _field_identity(field: CandidateField) -> tuple[str, str | None, str]:
+        return (field.path, field.table, field.field)
+
+    def _candidate_field_known(
+        self,
+        candidate: CandidateField,
+        known_fields: dict[str, set[tuple[str | None, str]]],
+    ) -> bool:
+        available = known_fields.get(candidate.path, set())
+        if candidate.table is not None:
+            return (candidate.table, candidate.field) in available
+        return any(field == candidate.field for _, field in available)
+
+    def lock_requirements(
+        self,
+        _: PublicTask,
+        arguments: LockRequirementsInput,
+    ) -> ToolExecutionResult:
+        if error := self._require_inspection():
+            return error
+        if self.requirements_locked:
+            return _error_result(
+                "REQUIREMENTS_ALREADY_LOCKED",
+                "Task requirements are immutable after the first successful lock.",
+            )
+        rendered = json.dumps(
+            arguments.model_dump(mode="json"),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        if len(rendered) > self.config.max_report_chars:
+            return _error_result(
+                "REQUIREMENT_PLAN_TOO_LARGE",
+                f"Requirement plan exceeds {self.config.max_report_chars} characters.",
+            )
+
+        known_fields = self._known_fields()
+        for requirement in arguments.requirements:
+            unknown_paths = set(requirement.candidate_paths) - self.discovered_paths
+            if unknown_paths:
+                return _error_result(
+                    "UNKNOWN_CANDIDATE_PATH",
+                    f"Requirement {requirement.id} references uninspected paths: "
+                    f"{sorted(unknown_paths)}",
+                )
+            for candidate in requirement.candidate_fields:
+                if candidate.path not in requirement.candidate_paths:
+                    return _error_result(
+                        "CANDIDATE_PATH_MISMATCH",
+                        f"Candidate field {candidate.path}.{candidate.field} is outside "
+                        f"requirement {requirement.id} candidate_paths.",
+                    )
+                if not self._candidate_field_known(candidate, known_fields):
+                    return _error_result(
+                        "UNKNOWN_CANDIDATE_FIELD",
+                        f"Inventory does not contain candidate field "
+                        f"{candidate.path}.{candidate.field}.",
+                    )
+            if len(requirement.candidate_fields) > 1 and not requirement.needs_discovery:
+                return _error_result(
+                    "AMBIGUITY_REQUIRES_DISCOVERY",
+                    f"Requirement {requirement.id} has multiple candidate fields and must "
+                    "set needs_discovery=true.",
+                )
+
+        uncovered_knowledge = self.knowledge_paths - {
+            path
+            for requirement in arguments.requirements
+            if requirement.kind == "knowledge" and requirement.needs_discovery
+            for path in requirement.candidate_paths
+        }
+        if uncovered_knowledge:
+            return _error_result(
+                "KNOWLEDGE_REQUIREMENT_MISSING",
+                f"Add needs_discovery knowledge requirements for: {sorted(uncovered_knowledge)}",
+            )
+
+        self.locked_requirements = {item.id: item for item in arguments.requirements}
+        self.requirement_call_counts = {item.id: 0 for item in arguments.requirements}
+        self.requirements_locked = True
+        ambiguous = [item.id for item in arguments.requirements if len(item.candidate_fields) > 1]
+        emit_event(
+            self.event_sink,
+            "explorer_requirements_locked",
+            {
+                "requirement_count": len(arguments.requirements),
+                "ambiguity_count": len(ambiguous),
+                "candidate_path_count": len(
+                    {
+                        path
+                        for requirement in arguments.requirements
+                        for path in requirement.candidate_paths
+                    }
+                ),
+                "candidate_field_count": sum(
+                    len(requirement.candidate_fields) for requirement in arguments.requirements
+                ),
+            },
+        )
+        return ToolExecutionResult(
+            ok=True,
+            content={
+                "status": "locked",
+                "requirement_ids": list(self.locked_requirements),
+                "needs_discovery": [
+                    item.id for item in arguments.requirements if item.needs_discovery
+                ],
+                "ambiguous_requirement_ids": ambiguous,
+            },
+        )
+
+    def _bind_discovery(
+        self,
+        arguments: _TargetedDiscoveryInput,
+        *,
+        path: str,
+    ) -> ToolExecutionResult | None:
+        if not self.requirements_locked:
+            return _error_result(
+                "REQUIREMENTS_NOT_LOCKED",
+                "Call lock_requirements after inspect_files and before discovery tools.",
+            )
+        unknown_ids = set(arguments.requirement_ids) - self.locked_requirements.keys()
+        if unknown_ids:
+            return _error_result(
+                "UNKNOWN_REQUIREMENT",
+                f"Discovery call references unlocked requirements: {sorted(unknown_ids)}",
+            )
+        for requirement_id in arguments.requirement_ids:
+            requirement = self.locked_requirements[requirement_id]
+            if path not in requirement.candidate_paths:
+                return _error_result(
+                    "PATH_OUTSIDE_REQUIREMENT",
+                    f"{path} is not a candidate path for requirement {requirement_id}.",
+                )
+            if (
+                self.requirement_call_counts[requirement_id]
+                >= self._MAX_DISCOVERY_CALLS_PER_REQUIREMENT
+            ):
+                return _error_result(
+                    "REQUIREMENT_DISCOVERY_BUDGET_EXHAUSTED",
+                    f"Requirement {requirement_id} already used "
+                    f"{self._MAX_DISCOVERY_CALLS_PER_REQUIREMENT} discovery calls.",
+                )
+
+        allowed_fields = {
+            self._field_identity(candidate)
+            for requirement_id in arguments.requirement_ids
+            for candidate in self.locked_requirements[requirement_id].candidate_fields
+        }
+        for candidate in arguments.target_fields:
+            if candidate.path != path or self._field_identity(candidate) not in allowed_fields:
+                return _error_result(
+                    "FIELD_OUTSIDE_REQUIREMENT",
+                    f"Target field {candidate.path}.{candidate.field} is not a locked "
+                    "candidate for this discovery call.",
+                )
+        for requirement_id in arguments.requirement_ids:
+            requirement = self.locked_requirements[requirement_id]
+            candidates_for_path = {
+                self._field_identity(candidate)
+                for candidate in requirement.candidate_fields
+                if candidate.path == path
+            }
+            if candidates_for_path and not candidates_for_path.intersection(
+                self._field_identity(candidate) for candidate in arguments.target_fields
+            ):
+                return _error_result(
+                    "TARGET_FIELD_REQUIRED",
+                    f"Discovery for requirement {requirement_id} must name at least one "
+                    "locked target field on this path.",
+                )
+        return None
+
+    def _record_discovery_call(self, arguments: _TargetedDiscoveryInput) -> None:
+        for requirement_id in arguments.requirement_ids:
+            self.requirement_call_counts[requirement_id] += 1
+
     def preview(self, task: PublicTask, arguments: PreviewFileInput) -> ToolExecutionResult:
         if error := self._require_inspection():
             return error
@@ -401,6 +656,8 @@ class _ExplorerTools:
                 "PREVIEW_BUDGET_EXHAUSTED",
                 f"Explorer may preview at most {self.config.max_preview_calls} files.",
             )
+        if error := self._bind_discovery(arguments, path=arguments.path):
+            return error
         self.preview_calls += 1
         is_knowledge = arguments.path in self.knowledge_paths
         if is_knowledge:
@@ -413,6 +670,7 @@ class _ExplorerTools:
                 self.config.max_preview_chars,
             )
         except Exception as exc:  # noqa: BLE001
+            self._record_discovery_call(arguments)
             if is_knowledge:
                 self.knowledge_failures.add(arguments.path)
                 emit_event(
@@ -426,6 +684,7 @@ class _ExplorerTools:
                 path=arguments.path,
                 requirement_ids=arguments.requirement_ids,
                 purpose=arguments.purpose,
+                target_fields=arguments.target_fields,
                 ok=False,
                 observation={
                     "path": arguments.path,
@@ -450,12 +709,14 @@ class _ExplorerTools:
                 error_code="PREVIEW_FAILED",
                 recoverable=True,
             )
+        self._record_discovery_call(arguments)
         evidence = self._add_evidence(
             prefix="preview",
             source_tool="preview_file",
             path=arguments.path,
             requirement_ids=arguments.requirement_ids,
             purpose=arguments.purpose,
+            target_fields=arguments.target_fields,
             observation=preview,
         )
         if is_knowledge:
@@ -469,18 +730,13 @@ class _ExplorerTools:
     def grep(self, task: PublicTask, arguments: GrepContextInput) -> ToolExecutionResult:
         if error := self._require_inspection():
             return error
-        if arguments.path is not None:
-            if arguments.path.startswith(("/", "\\")) or ".." in arguments.path.split("/"):
-                return _error_result("INVALID_PATH_FILTER", "grep path filter must be relative.")
-            normalized_filter = arguments.path.rstrip("/")
-            if not any(
-                path == normalized_filter or path.startswith(f"{normalized_filter}/")
-                for path in self.discovered_paths
-            ):
-                return _error_result(
-                    "PATH_NOT_INSPECTED",
-                    "grep path filter must select a path listed by inspect_files.",
-                )
+        if arguments.path not in self.discovered_paths:
+            return _error_result(
+                "PATH_NOT_INSPECTED",
+                "grep path must be one exact file listed by inspect_files.",
+            )
+        if error := self._bind_discovery(arguments, path=arguments.path):
+            return error
         self.grep_calls += 1
         try:
             observation = grep_context(
@@ -495,12 +751,14 @@ class _ExplorerTools:
             )
         except ValueError as exc:
             return _error_result("INVALID_GREP_PATTERN", str(exc))
+        self._record_discovery_call(arguments)
         evidence = self._add_evidence(
             prefix="grep",
             source_tool="grep_context",
             path=arguments.path,
             requirement_ids=arguments.requirement_ids,
             purpose=arguments.purpose,
+            target_fields=arguments.target_fields,
             observation=observation,
         )
         return ToolExecutionResult(ok=True, content=evidence)
@@ -518,6 +776,8 @@ class _ExplorerTools:
                 "NOT_SQLITE",
                 "execute_context_sql requires a .db, .sqlite, or .sqlite3 file.",
             )
+        if error := self._bind_discovery(arguments, path=arguments.path):
+            return error
         self.sql_calls += 1
         try:
             path = resolve_context_path(task, arguments.path)
@@ -529,12 +789,14 @@ class _ExplorerTools:
             )
         except (OSError, ValueError) as exc:
             return _error_result("EXPLORATION_SQL_ERROR", str(exc))
+        self._record_discovery_call(arguments)
         evidence = self._add_evidence(
             prefix="sql",
             source_tool="execute_context_sql",
             path=arguments.path,
             requirement_ids=arguments.requirement_ids,
             purpose=arguments.purpose,
+            target_fields=arguments.target_fields,
             observation=observation,
         )
         return ToolExecutionResult(ok=True, content=evidence)
@@ -682,12 +944,67 @@ class _ExplorerTools:
                     )
         return known
 
+    def _requirement_is_covered(self, requirement: LockedRequirement) -> bool:
+        if not requirement.needs_discovery:
+            return True
+        supporting = [
+            evidence
+            for evidence in self.evidence.values()
+            if evidence.get("source_tool") != "inspect_files"
+            and evidence.get("ok") is not False
+            and requirement.id in evidence.get("requirement_ids", [])
+        ]
+        if not supporting:
+            return False
+        if any(
+            evidence.get("source_tool") == "preview_file"
+            and evidence.get("path") in self.knowledge_paths
+            for evidence in supporting
+        ):
+            return True
+        required_fields = {
+            self._field_identity(candidate) for candidate in requirement.candidate_fields
+        }
+        if not required_fields:
+            return True
+        observed_fields = {
+            (
+                str(candidate["path"]),
+                candidate.get("table"),
+                str(candidate["field"]),
+            )
+            for evidence in supporting
+            for candidate in evidence.get("target_fields", [])
+            if isinstance(candidate, dict)
+            and candidate.get("path") is not None
+            and candidate.get("field") is not None
+        }
+        return required_fields.issubset(observed_fields)
+
+    def requirements_ready_for_report(self) -> bool:
+        return self.requirements_locked and all(
+            self._requirement_is_covered(requirement)
+            for requirement in self.locked_requirements.values()
+        )
+
+    def _runtime_requirements(self) -> list[dict[str, Any]]:
+        return [
+            {
+                **requirement.model_dump(mode="json"),
+                "ambiguous": len(requirement.candidate_fields) > 1,
+                "covered": self._requirement_is_covered(requirement),
+                "discovery_calls": self.requirement_call_counts.get(requirement.id, 0),
+            }
+            for requirement in self.locked_requirements.values()
+        ]
+
     def _runtime_report(self, *, selected_evidence_ids: set[str]) -> dict[str, Any]:
         report: dict[str, Any] = {
             "files": [],
             "schema_map": {},
             "task_requirements": [],
             "relevant_evidence": [],
+            "requirement_resolutions": [],
             "selected_sources": [],
             "knowledge": [],
             "etl_candidates": [],
@@ -894,17 +1211,9 @@ class _ExplorerTools:
         self,
         arguments: ExplorerReportInput,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], set[str], list[dict[str, Any]]]:
-        requirements: list[dict[str, Any]] = []
-        requirement_ids: set[str] = set()
+        requirements = self._runtime_requirements()
+        requirement_ids = set(self.locked_requirements)
         warnings: list[dict[str, Any]] = []
-        for requirement in arguments.task_requirements:
-            if requirement.id in requirement_ids:
-                warnings.append(
-                    self._warning(f"Ignored duplicate task requirement: {requirement.id}")
-                )
-                continue
-            requirement_ids.add(requirement.id)
-            requirements.append(requirement.model_dump(mode="json"))
 
         relevant_evidence: list[dict[str, Any]] = []
         selected_evidence_ids: set[str] = set()
@@ -935,6 +1244,65 @@ class _ExplorerTools:
                 }
             )
         return requirements, relevant_evidence, selected_evidence_ids, warnings
+
+    def _apply_requirement_resolutions(
+        self,
+        report: dict[str, Any],
+        arguments: ExplorerReportInput,
+        *,
+        selected_evidence_ids: set[str],
+    ) -> None:
+        seen: set[str] = set()
+        for resolution in arguments.requirement_resolutions:
+            requirement = self.locked_requirements.get(resolution.requirement_id)
+            if requirement is None or resolution.requirement_id in seen:
+                report["warnings"].append(
+                    self._warning(
+                        f"Ignored unknown or duplicate requirement resolution: "
+                        f"{resolution.requirement_id}"
+                    )
+                )
+                continue
+            seen.add(resolution.requirement_id)
+            refs = set(resolution.evidence_refs)
+            refs_supported = (
+                bool(refs)
+                and refs.issubset(selected_evidence_ids)
+                and all(
+                    resolution.requirement_id
+                    in self.evidence[evidence_id].get("requirement_ids", [])
+                    for evidence_id in refs
+                )
+            )
+            candidate_identities = {
+                self._field_identity(candidate) for candidate in requirement.candidate_fields
+            }
+            selected_identity = (
+                self._field_identity(resolution.selected_field)
+                if resolution.selected_field is not None
+                else None
+            )
+            rejected_identities = {
+                self._field_identity(candidate) for candidate in resolution.rejected_fields
+            }
+            fields_supported = (
+                (selected_identity is None or selected_identity in candidate_identities)
+                and rejected_identities.issubset(candidate_identities)
+                and selected_identity not in rejected_identities
+            )
+            resolved_shape_valid = not (
+                resolution.status == "resolved"
+                and requirement.candidate_fields
+                and selected_identity is None
+            )
+            if not refs_supported or not fields_supported or not resolved_shape_valid:
+                report["warnings"].append(
+                    self._warning(
+                        f"Ignored unsupported requirement resolution: {resolution.requirement_id}"
+                    )
+                )
+                continue
+            report["requirement_resolutions"].append(resolution.model_dump(mode="json"))
 
     def _apply_semantic_increments(
         self,
@@ -1115,6 +1483,11 @@ class _ExplorerTools:
                 ):
                     selected_paths.add(match["path"])
         if arguments is not None:
+            self._apply_requirement_resolutions(
+                report,
+                arguments,
+                selected_evidence_ids=selected_evidence_ids,
+            )
             self._apply_semantic_increments(
                 report,
                 arguments,
@@ -1123,6 +1496,22 @@ class _ExplorerTools:
             selected_paths.update(
                 path for path in arguments.selected_sources if path in self.discovered_paths
             )
+        elif self.locked_requirements:
+            report["requirement_resolutions"] = [
+                {
+                    "requirement_id": requirement.id,
+                    "status": "unresolved",
+                    "selected_field": None,
+                    "rejected_fields": [],
+                    "evidence_refs": [
+                        evidence_id
+                        for evidence_id in selected_evidence_ids
+                        if requirement.id in self.evidence[evidence_id].get("requirement_ids", [])
+                    ][:8],
+                    "note": "Fallback preserved evidence without inferring a semantic resolution.",
+                }
+                for requirement in self.locked_requirements.values()
+            ]
         report["selected_sources"] = sorted(selected_paths)
         if fallback_reason is not None:
             first_ref = next(iter(self.evidence), None)
@@ -1167,19 +1556,7 @@ class _ExplorerTools:
 
         selected = prioritized[:8]
         selected_ids = {str(evidence["evidence_id"]) for evidence in selected}
-        descriptions: dict[str, str] = {}
-        for evidence in selected:
-            purpose = str(evidence.get("purpose") or "Required by a targeted discovery call.")
-            for requirement_id in evidence.get("requirement_ids", []):
-                descriptions.setdefault(str(requirement_id), purpose)
-        requirements = [
-            {
-                "id": requirement_id,
-                "kind": "other",
-                "description": description,
-            }
-            for requirement_id, description in descriptions.items()
-        ]
+        requirements = self._runtime_requirements()
         relevant_evidence = [
             {
                 "evidence_id": evidence["evidence_id"],
@@ -1204,6 +1581,11 @@ class _ExplorerTools:
     def report(self, _: PublicTask, arguments: ExplorerReportInput) -> ToolExecutionResult:
         if error := self._require_inspection():
             return error
+        if not self.requirements_locked:
+            return _error_result(
+                "REQUIREMENTS_NOT_LOCKED",
+                "Call lock_requirements successfully before report.",
+            )
         missing_knowledge = self.knowledge_paths - self.knowledge_attempted
         if missing_knowledge:
             return _error_result(
@@ -1267,6 +1649,16 @@ class _ExplorerTools:
                 input_model=InspectFilesInput,
                 handler=self.inspect,
             ),
+            "lock_requirements": ToolSpec(
+                name="lock_requirements",
+                description=(
+                    "Use once and alone immediately after inspect_files. Lock the question's "
+                    "entities, measures, filters, time scope, output, knowledge, and joins "
+                    "to real inspected candidate paths and fields. Requirements are immutable."
+                ),
+                input_model=LockRequirementsInput,
+                handler=self.lock_requirements,
+            ),
             "preview_file": ToolSpec(
                 name="preview_file",
                 description=(
@@ -1280,10 +1672,10 @@ class _ExplorerTools:
             "report": ToolSpec(
                 name="report",
                 description=(
-                    "Submit task_requirements and select only question-relevant deep "
-                    "observations through relevant_evidence, plus supported semantic "
-                    "increments. The runtime preserves a compact background inventory and "
-                    "projects only selected preview/grep/SQL evidence. Must be the only call."
+                    "Select only question-relevant deep observations and submit supported "
+                    "requirement resolutions and semantic increments. The runtime owns the "
+                    "locked requirements, compact inventory, schemas, and evidence provenance. "
+                    "Must be the only call."
                 ),
                 input_model=ExplorerReportInput,
                 handler=self.report,
@@ -1293,6 +1685,11 @@ class _ExplorerTools:
         if not self.inspect_completed:
             return ToolRegistry(specs={"inspect_files": specs["inspect_files"]})
         specs.pop("inspect_files")
+        if not self.requirements_locked:
+            return ToolRegistry(specs={"lock_requirements": specs["lock_requirements"]})
+        specs.pop("lock_requirements")
+        if final_step or self.requirements_ready_for_report():
+            return ToolRegistry(specs={"report": specs["report"]})
         if not any(
             path.casefold().endswith((".db", ".sqlite", ".sqlite3"))
             for path in self.discovered_paths
@@ -1300,8 +1697,7 @@ class _ExplorerTools:
             specs.pop("execute_context_sql")
         if self.preview_calls >= self.config.max_preview_calls:
             specs.pop("preview_file")
-        if final_step:
-            return ToolRegistry(specs={"report": specs["report"]})
+        specs.pop("report")
         return ToolRegistry(specs=specs)
 
 
@@ -1333,7 +1729,14 @@ class ExplorerRunner:
         )
         relevance_metrics = {
             "task_requirement_count": len(report.get("task_requirements", [])),
+            "ambiguous_requirement_count": sum(
+                bool(item.get("ambiguous")) for item in report.get("task_requirements", [])
+            ),
+            "covered_requirement_count": sum(
+                bool(item.get("covered")) for item in report.get("task_requirements", [])
+            ),
             "relevant_evidence_count": len(report.get("relevant_evidence", [])),
+            "requirement_resolution_count": len(report.get("requirement_resolutions", [])),
             "selected_source_count": len(report.get("selected_sources", [])),
             "report_chars": report_chars,
         }
@@ -1448,9 +1851,9 @@ class ExplorerRunner:
                 content=(
                     f"FINAL REPORT RETRY {retry_index}/{self._MAX_FINAL_REPORT_RETRIES}: "
                     f"the prior final attempt failed with {error_code}. Call report as the "
-                    "only tool now. Declare task_requirements and select only evidence whose "
-                    "recorded requirement_ids support them. Empty semantic lists are valid "
-                    "because the runtime preserves the compact background inventory."
+                    "only tool now. Select only evidence whose recorded requirement_ids "
+                    "support the immutable locked plan. Empty semantic lists are valid "
+                    "because the runtime preserves requirements and the compact inventory."
                 ),
             )
         )
@@ -1551,6 +1954,22 @@ class ExplorerRunner:
                         "INSPECT_REQUIRED",
                         "The first successful Explorer turn must call inspect_files alone.",
                     )
+                elif (
+                    tools.inspect_completed
+                    and not tools.requirements_locked
+                    and (len(calls) != 1 or calls[0].name != "lock_requirements")
+                ):
+                    protocol_error = (
+                        "REQUIREMENTS_LOCK_REQUIRED",
+                        "The second successful Explorer turn must call lock_requirements alone.",
+                    )
+                elif any(call.name == "lock_requirements" for call in calls) and (
+                    len(calls) != 1 or calls[0].name != "lock_requirements"
+                ):
+                    protocol_error = (
+                        "LOCK_REQUIREMENTS_MUST_BE_EXCLUSIVE",
+                        "lock_requirements must be the only tool call in its turn.",
+                    )
                 elif any(call.name == "report" for call in calls) and (
                     len(calls) != 1 or calls[0].name != "report"
                 ):
@@ -1558,7 +1977,11 @@ class ExplorerRunner:
                         "REPORT_MUST_BE_EXCLUSIVE",
                         "report must be the only tool call in its turn.",
                     )
-                elif final_step and (len(calls) != 1 or calls[0].name != "report"):
+                elif (
+                    final_step
+                    and tools.requirements_locked
+                    and (len(calls) != 1 or calls[0].name != "report")
+                ):
                     protocol_error = (
                         "FINAL_REPORT_REQUIRED",
                         "The final Explorer turn accepts only one report call.",
@@ -1642,7 +2065,11 @@ class ExplorerRunner:
                     if result.is_terminal and result.ok:
                         terminal_result = result
                     elif final_step:
-                        final_error_code = result.error_code or "FINAL_REPORT_REJECTED"
+                        final_error_code = result.error_code or (
+                            "FINAL_REPORT_REQUIRED"
+                            if call.name != "report"
+                            else "FINAL_REPORT_REJECTED"
+                        )
 
                 if terminal_result is not None:
                     report = terminal_result.content["report"]
@@ -1654,7 +2081,18 @@ class ExplorerRunner:
                             "fallback_used": False,
                             "final_report_retries": final_retry_index,
                             "task_requirement_count": len(report.get("task_requirements", [])),
+                            "ambiguous_requirement_count": sum(
+                                bool(item.get("ambiguous"))
+                                for item in report.get("task_requirements", [])
+                            ),
+                            "covered_requirement_count": sum(
+                                bool(item.get("covered"))
+                                for item in report.get("task_requirements", [])
+                            ),
                             "relevant_evidence_count": len(report.get("relevant_evidence", [])),
+                            "requirement_resolution_count": len(
+                                report.get("requirement_resolutions", [])
+                            ),
                             "selected_source_count": len(report.get("selected_sources", [])),
                             "report_chars": len(
                                 json.dumps(
@@ -1748,8 +2186,9 @@ def create_explorer_tool_spec(
         name="explore",
         description=(
             "Use first as explore({}). It launches a Phase 1 discovery-only sub-agent that "
-            "inspects all context files, explicitly reads knowledge.md, performs bounded "
-            "preview/grep/read-only SQL discovery, and returns an evidence-backed data map."
+            "inspects context files, locks question requirements to real candidate paths and "
+            "fields, explicitly reads knowledge.md, performs bounded targeted discovery, and "
+            "returns an evidence-backed data map."
         ),
         input_model=ExploreInput,
         handler=ExplorerToolHandler(
