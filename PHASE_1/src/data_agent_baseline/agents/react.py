@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any
 
 from data_agent_baseline.agents.model import (
     ModelAdapter,
@@ -83,7 +82,6 @@ class ReActAgent:
         system_prompt: str | None = None,
         event_sink: EventSink | None = None,
         answer_verifier: AnswerVerifier | None = None,
-        context_inventory: dict[str, Any] | None = None,
     ) -> None:
         self.model = model
         self.tools = tools
@@ -91,13 +89,9 @@ class ReActAgent:
         self.system_prompt = system_prompt or REACT_SYSTEM_PROMPT
         self.event_sink = event_sink
         self.answer_verifier = answer_verifier or AnswerVerifier()
-        self.context_inventory = context_inventory
 
     def _exploration_required(self) -> bool:
-        if "explore" not in self.tools.specs or not isinstance(self.context_inventory, dict):
-            return False
-        exploration = self.context_inventory.get("exploration")
-        return isinstance(exploration, dict) and exploration.get("recommended") is True
+        return "explore" in self.tools.specs
 
     def _active_tools(
         self, *, exploration_pending: bool, exploration_required: bool
@@ -123,10 +117,7 @@ class ReActAgent:
             ),
             ModelMessage(
                 role="user",
-                content=build_task_prompt(
-                    task,
-                    context_inventory=self.context_inventory,
-                ),
+                content=build_task_prompt(task),
             ),
         ]
 
@@ -314,7 +305,7 @@ class ReActAgent:
                 },
             )
             tool_result = active_tools.execute(task, call)
-            if exploration_pending and call.name == "explore" and tool_result.ok:
+            if exploration_pending and call.name == "explore":
                 exploration_pending = False
             if tool_result.is_terminal:
                 tool_result = self._verify_terminal_answer(

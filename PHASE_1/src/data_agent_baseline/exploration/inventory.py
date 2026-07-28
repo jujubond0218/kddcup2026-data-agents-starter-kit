@@ -623,100 +623,6 @@ def _relation_candidates(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [candidate for _, candidate in candidates[:MAX_RELATION_CANDIDATES]]
 
 
-def _question_tokens(question: str) -> set[str]:
-    expanded = re.sub(r"([a-z])([A-Z])", r"\1 \2", question)
-    return {token for token in re.findall(r"[a-z0-9]+", expanded.casefold()) if len(token) >= 3}
-
-
-def _field_tokens(field: str) -> set[str]:
-    expanded = re.sub(r"([a-z])([A-Z])", r"\1 \2", field)
-    return {token for token in re.findall(r"[a-z0-9]+", expanded.casefold()) if len(token) >= 3}
-
-
-def _build_exploration(
-    task: PublicTask,
-    entries: list[dict[str, Any]],
-    relation_candidates: list[dict[str, Any]],
-) -> dict[str, Any]:
-    structured = [entry for entry in entries if entry.get("kind") in {"tabular", "json", "sqlite"}]
-    codes: list[str] = []
-    candidate_paths: list[str] = []
-    triggered = False
-
-    def add_code(code: str, paths: list[str], *, triggers_exploration: bool = False) -> None:
-        nonlocal triggered
-        if code not in codes:
-            codes.append(code)
-        triggered = triggered or triggers_exploration
-        for path in paths:
-            if path not in candidate_paths and len(candidate_paths) < MAX_EXPLORATION_PATHS:
-                candidate_paths.append(path)
-
-    partial_json_paths = [
-        str(entry["path"])
-        for entry in structured
-        if entry.get("kind") == "json"
-        and entry.get("summary", {}).get("truncated")
-        and entry.get("summary", {}).get("field_paths")
-    ]
-    if partial_json_paths:
-        peer_paths = [
-            str(entry["path"]) for entry in structured if entry["path"] not in partial_json_paths
-        ]
-        add_code(
-            "PARTIAL_JSON_STRUCTURE",
-            partial_json_paths + peer_paths,
-            triggers_exploration=True,
-        )
-
-    if relation_candidates:
-        relation_paths: list[str] = []
-        for candidate in relation_candidates:
-            relation_paths.extend([candidate["left"]["path"], candidate["right"]["path"]])
-        add_code("MULTI_SOURCE_RELATION_CANDIDATES", relation_paths)
-
-    wide_paths = [
-        str(entry["path"])
-        for entry in structured
-        if len(entry.get("summary", {}).get("columns", [])) >= 20
-    ]
-    if wide_paths and len(structured) > 1:
-        add_code(
-            "WIDE_SOURCE_WITH_PEERS",
-            wide_paths + [str(entry["path"]) for entry in structured],
-            triggers_exploration=True,
-        )
-
-    question_tokens = _question_tokens(task.question)
-    matched_paths = []
-    for entry in structured:
-        profiles = entry.get("summary", {}).get("_field_profiles", [])
-        if any(_field_tokens(str(profile["field"])) & question_tokens for profile in profiles):
-            matched_paths.append(str(entry["path"]))
-    if len(matched_paths) >= 2:
-        add_code(
-            "MULTI_SOURCE_QUESTION_FIELDS",
-            matched_paths,
-            triggers_exploration=len(relation_candidates) >= 3,
-        )
-
-    recommended = bool(triggered and candidate_paths)
-    if not recommended:
-        candidate_paths = []
-    focus = ""
-    if recommended:
-        focus = (
-            "Resolve the flagged source, field, and relationship ambiguities using only "
-            "the supplied candidates and evidence; return concrete checks for the main agent."
-        )
-    return {
-        "recommended": recommended,
-        "focus": focus,
-        "candidate_paths": candidate_paths,
-        "ambiguity_codes": codes,
-    }
-
-
 def _remove_private_profiles(entries: list[dict[str, Any]]) -> None:
     for entry in entries:
         summary = entry.get("summary")
@@ -724,7 +630,7 @@ def _remove_private_profiles(entries: list[dict[str, Any]]) -> None:
             summary.pop("_field_profiles", None)
 
 
-def _reconcile_exploration(report: dict[str, Any]) -> None:
+def _reconcile_relation_candidates(report: dict[str, Any]) -> None:
     retained_paths = {
         str(entry["path"])
         for entry in report.get("files", [])
@@ -736,20 +642,6 @@ def _reconcile_exploration(report: dict[str, Any]) -> None:
         if candidate.get("left", {}).get("path") in retained_paths
         and candidate.get("right", {}).get("path") in retained_paths
     ]
-    exploration = report.get("exploration")
-    if not isinstance(exploration, dict):
-        return
-    exploration["candidate_paths"] = [
-        path for path in exploration.get("candidate_paths", []) if path in retained_paths
-    ]
-    if not exploration["candidate_paths"]:
-        exploration.update(
-            {
-                "recommended": False,
-                "focus": "",
-                "ambiguity_codes": [],
-            }
-        )
 
 
 def _shorten_inventory(report: dict[str, Any], max_chars: int) -> dict[str, Any]:
@@ -792,20 +684,14 @@ def _shorten_inventory(report: dict[str, Any], max_chars: int) -> dict[str, Any]
         return shortened
     while shortened["files"] and not fits(shortened):
         shortened["files"].pop()
-    _reconcile_exploration(shortened)
+    _reconcile_relation_candidates(shortened)
     shortened["truncated"] = True
     if fits(shortened):
         return shortened
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "status": "partial",
         "files": [],
-        "exploration": {
-            "recommended": False,
-            "focus": "",
-            "candidate_paths": [],
-            "ambiguity_codes": [],
-        },
         "relation_candidates": [],
         "warnings": [
             _warning("INVENTORY_OUTPUT_TRUNCATED", "Inventory exceeded the output budget.")
@@ -892,6 +778,12 @@ def inspect_context(task: PublicTask, limits: InventoryLimits) -> dict[str, Any]
             summary = {}
             consumed = 0
             file_warnings = [_warning("FILE_READ_ERROR", str(exc))]
+        if relative_path.rsplit("/", 1)[-1].casefold() == "knowledge.md":
+            # Discovery may reveal that the knowledge file exists and list its
+            # headings, but its rules must enter the Explorer through an explicit
+            # preview_file call with a separately tracked evidence ID.
+            summary.pop("preview", None)
+            summary["requires_explicit_preview"] = True
         read_bytes += consumed
         entries.append(
             {
@@ -905,13 +797,11 @@ def inspect_context(task: PublicTask, limits: InventoryLimits) -> dict[str, Any]
             warnings.append({**item, "path": relative_path})
 
     relation_candidates = _relation_candidates(entries)
-    exploration = _build_exploration(task, entries, relation_candidates)
     _remove_private_profiles(entries)
     report = {
-        "schema_version": 2,
+        "schema_version": 3,
         "status": "partial" if truncated else "ok",
         "files": entries,
-        "exploration": exploration,
         "relation_candidates": relation_candidates,
         "warnings": warnings,
         "budget": {

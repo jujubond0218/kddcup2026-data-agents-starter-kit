@@ -102,12 +102,12 @@ run:
 
 explorer:
   enabled: true
-  max_steps: 3
+  max_steps: 10
+  max_duration_seconds: 60
   max_files: 64
   max_preview_calls: 2
   max_preview_chars: 2000
   max_inventory_chars: 12000
-  max_prompt_inventory_chars: 6000
   max_report_chars: 4000
 ```
 
@@ -128,9 +128,9 @@ Config fields:
 | `run.run_id` | Optional run directory name. Defaults to a UTC timestamp if omitted. Required by `--resume`. |
 | `run.max_workers` | Parallel worker count for `run-benchmark`. |
 | `run.task_timeout_seconds` | Maximum wall-clock time per task. Set to `0` or a negative value to disable the task-level timeout. |
-| `explorer.enabled` | Injects Inventory v2. When deterministic ambiguity signals recommend exploration, the first model turn exposes one focused `explore` call before restoring the normal tools. |
-| `explorer.max_steps` | Maximum native tool-calling steps available to one focused Explorer run. |
-| `explorer.max_prompt_inventory_chars` | Maximum serialized Inventory characters injected before the first model request. |
+| `explorer.enabled` | Exposes one argument-free `explore({})` call on the main Agent's first turn. The Explorer builds the file map; no Inventory is injected before the call. |
+| `explorer.max_steps` | Hard limit on Explorer model turns. The Explorer may execute up to two independent discovery tools in one turn. |
+| `explorer.max_duration_seconds` | Explorer soft wall-clock limit. On expiry, successful evidence is converted into a bounded fallback data map before the task-level hard timeout. |
 
 ## CLI
 
@@ -185,9 +185,12 @@ uv run dabench run-benchmark \
 
 ## Tools
 
-Tools are advertised through the OpenAI-compatible native `tools` field. The model returns
+Tools are advertised through the OpenAI-compatible native `tools` field. The main Agent returns
 one `tool_call` per turn, the registry validates its JSON arguments with Pydantic before
 execution, and the result is returned as a `tool` message with the matching `tool_call_id`.
+The Explorer is the only scoped exception: after its required standalone `inspect_files({})`
+turn, it may return up to two independent discovery calls in one turn; each receives a separate
+tool observation with its original call ID.
 An `answer` call must also pass deterministic CSV-safety verification before it can terminate
 the task; rejected candidates receive a recoverable tool observation for correction.
 The same Chat Completions flow works with Alibaba Cloud Model Studio's OpenAI-compatible
@@ -198,7 +201,7 @@ The baseline exposes these tools to the model:
 | Tool | Purpose | Inputs |
 | --- | --- | --- |
 | `list_context` | List files and directories under `context/`. | `max_depth` |
-| `explore` | Resolve an Inventory-v2 ambiguity with one bounded evidence-first sub-agent call; it is exposed only for the required first turn and then removed. | `focus`, `candidate_paths` |
+| `explore` | Launch one bounded Phase 1 discovery sub-agent. It inspects files, explicitly previews every `knowledge.md`, and may use bounded preview, grep, and read-only SQL before returning an evidence-backed data map. It is removed after the call even on fail-open. | none (`{}`) |
 | `read_csv` | Read a CSV preview. | `path`, `max_rows` |
 | `read_json` | Read a JSON preview. | `path`, `max_chars` |
 | `read_doc` | Read a text document preview. | `path`, `max_chars` |
@@ -208,6 +211,9 @@ The baseline exposes these tools to the model:
 | `answer` | Submit the final answer table and terminate the task. | `columns`, `rows` |
 
 All file paths passed to tools must be relative to the task `context/` directory.
+Inside `explore`, the child registry is limited to `inspect_files`, `preview_file`,
+`grep_context`, bounded read-only `execute_context_sql`, and terminal `report`. These child
+tools are never exposed to the main Agent at the same time as its normal computation tools.
 
 ## Outputs
 

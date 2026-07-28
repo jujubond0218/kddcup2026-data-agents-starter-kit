@@ -1,7 +1,5 @@
 import json
-
-import pytest
-from pydantic import ValidationError
+import sqlite3
 
 from data_agent_baseline.agents.model import ModelResponse, ModelToolCall, ScriptedModelAdapter
 from data_agent_baseline.agents.react import ReActAgent
@@ -13,12 +11,14 @@ from data_agent_baseline.config import (
     ExplorerConfig as AppExplorerConfig,
     RunConfig,
 )
-from data_agent_baseline.exploration.inventory import inspect_context
 from data_agent_baseline.exploration.runner import (
     ExploreInput,
     ExplorerConfig,
     ExplorerReportInput,
     ExplorerRunner,
+    ExplorerSqlInput,
+    GrepContextInput,
+    InspectFilesInput,
     PreviewFileInput,
     _ExplorerTools,
     create_explorer_tool_spec,
@@ -27,7 +27,7 @@ from data_agent_baseline.run.runner import run_benchmark
 from data_agent_baseline.tools.registry import ToolRegistry, create_default_tool_registry
 
 
-def _task(tmp_path) -> PublicTask:
+def _task(tmp_path, *, knowledge: bool = False) -> PublicTask:
     task_dir = tmp_path / "task_1"
     context_dir = task_dir / "context"
     context_dir.mkdir(parents=True)
@@ -35,68 +35,114 @@ def _task(tmp_path) -> PublicTask:
         "customer_id,amount\nC1,10\nC2,20\nC3,30\n",
         encoding="utf-8",
     )
+    if knowledge:
+        (context_dir / "knowledge.md").write_text(
+            "# Sales rules\nRevenue maps to `amount`.\n",
+            encoding="utf-8",
+        )
     return PublicTask(
         record=TaskRecord(task_id="task_1", difficulty="easy", question="Find sales."),
         assets=TaskAssets(task_dir=task_dir, context_dir=context_dir),
     )
 
 
-def _response(name: str, arguments: dict, call_id: str) -> ModelResponse:
-    call = ModelToolCall(id=call_id, name=name, arguments=json.dumps(arguments))
+def _call(name: str, arguments: dict, call_id: str) -> ModelToolCall:
+    return ModelToolCall(id=call_id, name=name, arguments=json.dumps(arguments))
+
+
+def _response(*calls: ModelToolCall) -> ModelResponse:
     return ModelResponse(
         content="",
-        tool_calls=(call,),
-        raw_response=json.dumps({"tool_calls": [call.to_openai_dict()]}),
+        tool_calls=tuple(calls),
+        raw_response=json.dumps({"tool_calls": [call.to_openai_dict() for call in calls]}),
         finish_reason="tool_calls",
     )
 
 
-def _request() -> ExploreInput:
-    return ExploreInput(
-        focus="Confirm the fields needed for the sales question.",
-        candidate_paths=["sales.csv"],
+def _single_response(name: str, arguments: dict, call_id: str) -> ModelResponse:
+    return _response(_call(name, arguments, call_id))
+
+
+def _report(
+    *,
+    inspect_ref: str = "inspect:1",
+    sales_ref: str | None = None,
+    knowledge_ref: str | None = None,
+    knowledge_path: str = "knowledge.md",
+) -> dict:
+    schema_ref = sales_ref or inspect_ref
+    report = {
+        "files": [
+            {
+                "path": "sales.csv",
+                "format": "tabular",
+                "row_count": 3,
+                "evidence_refs": [inspect_ref],
+            }
+        ],
+        "schema_map": {
+            "sales.csv": {
+                "path": "sales.csv",
+                "table": None,
+                "columns": ["customer_id", "amount"],
+                "semantics": {},
+                "evidence_refs": [schema_ref],
+            }
+        },
+        "knowledge": [],
+        "etl_candidates": [],
+        "join_paths": [],
+        "value_samples": {},
+        "warnings": [],
+    }
+    if knowledge_ref is not None:
+        report["files"].append(
+            {
+                "path": knowledge_path,
+                "format": "markdown",
+                "row_count": None,
+                "evidence_refs": [inspect_ref],
+            }
+        )
+        report["knowledge"].append(
+            {
+                "path": knowledge_path,
+                "kind": "field_mapping",
+                "text": "Revenue maps to amount.",
+                "evidence_refs": [knowledge_ref],
+            }
+        )
+    return report
+
+
+def _write_task_json(task: PublicTask) -> None:
+    (task.task_dir / "task.json").write_text(
+        json.dumps(
+            {
+                "task_id": task.task_id,
+                "difficulty": task.difficulty,
+                "question": task.question,
+            }
+        ),
+        encoding="utf-8",
     )
 
 
-def _report(*, evidence_ref: str = "preview:1") -> dict:
-    return {
-        "selected_sources": [
-            {
-                "path": "sales.csv",
-                "reason": "Contains the requested sales fields.",
-                "evidence_refs": [evidence_ref],
-            }
-        ],
-        "evidence_refs": [evidence_ref],
-        "key_fields": [
-            {
-                "path": "sales.csv",
-                "field": "amount",
-                "table": None,
-                "reason": "Requested measure.",
-                "evidence_refs": [evidence_ref],
-            }
-        ],
-        "join_candidates": [],
-        "recommended_checks": [],
-        "etl_candidates": [],
-        "warnings": [],
-        "uncertainties": [],
-    }
-
-
-def _inventory(task: PublicTask, config: ExplorerConfig | None = None) -> dict:
-    effective_config = config or ExplorerConfig()
-    return inspect_context(task, effective_config.inventory_limits())
-
-
-def test_explorer_returns_evidence_first_report_without_inventory_model_step(tmp_path):
-    task = _task(tmp_path)
-    config = ExplorerConfig(max_steps=2, max_preview_calls=1)
+def test_explorer_inspects_then_reads_knowledge_and_supports_two_calls_per_turn(tmp_path):
+    task = _task(tmp_path, knowledge=True)
+    config = ExplorerConfig(max_steps=3, max_preview_calls=2)
     model = ScriptedModelAdapter(
         [
-            _response("preview_file", {"path": "sales.csv"}, "explore_preview"),
-            _response("report", _report(), "explore_report"),
+            _single_response("inspect_files", {}, "inspect_call"),
+            _response(
+                _call("preview_file", {"path": "knowledge.md"}, "knowledge_preview"),
+                _call("preview_file", {"path": "sales.csv"}, "sales_preview"),
+            ),
+            _single_response(
+                "report",
+                _report(sales_ref="preview:2", knowledge_ref="preview:1"),
+                "report_call",
+            ),
         ]
     )
     events = []
@@ -104,290 +150,428 @@ def test_explorer_returns_evidence_first_report_without_inventory_model_step(tmp
     result = ExplorerRunner(
         model=model,
         config=config,
-        inventory=_inventory(task, config),
         event_sink=lambda kind, payload: events.append((kind, payload)),
-    ).run(task, _request())
+    ).run(task, ExploreInput())
 
     assert result.success is True
     assert result.fallback_used is False
-    assert result.report == _report()
-    assert result.evidence[0]["evidence_id"] == "preview:1"
-    assert result.steps_used == 2
-    assert "candidate_evidence" in model.requests[0][1].content
-    assert model.requests[1][-1].tool_call_id == "explore_preview"
+    assert result.steps_used == 3
+    assert {item["evidence_id"] for item in result.evidence} == {
+        "inspect:1",
+        "preview:1",
+        "preview:2",
+    }
+    assert model.requests[2][-2].tool_call_id == "knowledge_preview"
+    assert model.requests[2][-1].tool_call_id == "sales_preview"
+    assert any(kind == "explorer_knowledge_reviewed" for kind, _ in events)
     assert any(kind == "explorer_completed" for kind, _ in events)
 
 
-def test_explorer_finishes_with_two_previews_and_report_within_three_requests(tmp_path):
+def test_explorer_requires_inspect_as_first_successful_turn(tmp_path):
     task = _task(tmp_path)
-    (task.context_dir / "notes.md").write_text(
-        "# Sales notes\namount is numeric\n", encoding="utf-8"
-    )
-    config = ExplorerConfig(max_steps=3, max_preview_calls=2)
-    inventory = _inventory(task, config)
-    request = ExploreInput(
-        focus="Confirm sales fields and supporting notes.",
-        candidate_paths=["sales.csv", "notes.md"],
-    )
-    report = _report()
-    report["selected_sources"].append(
-        {
-            "path": "notes.md",
-            "reason": "Defines the amount field.",
-            "evidence_refs": ["preview:2"],
-        }
-    )
-    report["evidence_refs"] = ["preview:1", "preview:2"]
     model = ScriptedModelAdapter(
         [
-            _response("preview_file", {"path": "sales.csv"}, "preview_one"),
-            _response("preview_file", {"path": "notes.md"}, "preview_two"),
-            _response("report", report, "report"),
+            _single_response("preview_file", {"path": "sales.csv"}, "premature"),
+            _single_response("inspect_files", {}, "inspect"),
+            _single_response("report", _report(), "report"),
         ]
     )
 
     result = ExplorerRunner(
         model=model,
-        config=config,
-        inventory=inventory,
-    ).run(task, request)
+        config=ExplorerConfig(max_steps=3),
+    ).run(task, ExploreInput())
 
-    assert result.fallback_used is False
+    assert result.success is True
     assert result.steps_used == 3
-    assert len(model.requests) == 3
-    assert {item["evidence_id"] for item in result.evidence} == {
-        "preview:1",
-        "preview:2",
-    }
+    protocol_observation = json.loads(model.requests[1][-1].content)
+    assert protocol_observation["content"]["error"]["code"] == "INSPECT_REQUIRED"
 
 
-def test_explorer_final_step_requires_report_and_fails_open(tmp_path):
+def test_explorer_rejects_more_than_two_calls_and_mixed_report(tmp_path):
     task = _task(tmp_path)
-    config = ExplorerConfig(max_steps=1)
-    result = ExplorerRunner(
-        model=ScriptedModelAdapter(
-            [_response("preview_file", {"path": "sales.csv"}, "late_preview")]
-        ),
-        config=config,
-        inventory=_inventory(task, config),
-    ).run(task, _request())
-
-    assert result.success is True
-    assert result.fallback_used is True
-    assert result.steps_used == 1
-    assert result.report["selected_sources"][0]["path"] == "sales.csv"
-    assert result.evidence[0]["evidence_id"] == "inventory:1"
-
-
-def test_explorer_model_failure_returns_inventory_evidence_fallback(tmp_path):
-    task = _task(tmp_path)
-    config = ExplorerConfig()
-    result = ExplorerRunner(
-        model=ScriptedModelAdapter([]),
-        config=config,
-        inventory=_inventory(task, config),
-    ).run(task, _request())
-
-    assert result.success is True
-    assert result.fallback_used is True
-    assert result.evidence[0]["source_tool"] == "context_inventory"
-    assert "RuntimeError" in result.failure_reason
-
-
-def test_explore_input_enforces_focus_and_candidate_limits():
-    with pytest.raises(ValidationError):
-        ExploreInput(focus=" ", candidate_paths=["sales.csv"])
-    with pytest.raises(ValidationError):
-        ExploreInput(focus="x" * 501, candidate_paths=["sales.csv"])
-    with pytest.raises(ValidationError):
-        ExploreInput(focus="x", candidate_paths=[f"{index}.csv" for index in range(9)])
-    with pytest.raises(ValidationError):
-        ExploreInput(focus="x", candidate_paths=["sales.csv", "sales.csv"])
-
-
-def test_explorer_restricts_preview_paths_and_budget(tmp_path):
-    task = _task(tmp_path)
-    config = ExplorerConfig(max_preview_calls=1)
-    tools = _ExplorerTools(
-        config=config,
-        inventory=_inventory(task, config),
-        candidate_paths=["sales.csv"],
+    model = ScriptedModelAdapter(
+        [
+            _response(
+                _call("inspect_files", {}, "one"),
+                _call("inspect_files", {}, "two"),
+                _call("inspect_files", {}, "three"),
+            ),
+            _single_response("inspect_files", {}, "inspect"),
+            _response(
+                _call("preview_file", {"path": "sales.csv"}, "preview"),
+                _call("report", _report(), "mixed_report"),
+            ),
+            _single_response("report", _report(), "report"),
+        ]
     )
 
+    result = ExplorerRunner(
+        model=model,
+        config=ExplorerConfig(max_steps=4),
+    ).run(task, ExploreInput())
+
+    assert result.success is True
+    assert result.steps_used == 4
+    first_error = json.loads(model.requests[1][-1].content)
+    assert first_error["content"]["error"]["code"] == "TOO_MANY_TOOL_CALLS"
+    mixed_error = json.loads(model.requests[3][-1].content)
+    assert mixed_error["content"]["error"]["code"] == "REPORT_MUST_BE_EXCLUSIVE"
+
+
+def test_knowledge_must_be_attempted_before_report(tmp_path):
+    task = _task(tmp_path, knowledge=True)
+    tools = _ExplorerTools(config=ExplorerConfig())
+    inspected = tools.inspect(task, InspectFilesInput())
+    rejected = tools.report(task, ExplorerReportInput.model_validate(_report()))
+    previewed = tools.preview(task, PreviewFileInput(path="knowledge.md"))
+    accepted = tools.report(
+        task,
+        ExplorerReportInput.model_validate(_report(knowledge_ref=previewed.content["evidence_id"])),
+    )
+
+    assert inspected.ok is True
+    knowledge_summary = next(
+        item["summary"]
+        for item in inspected.content["observation"]["files"]
+        if item["path"] == "knowledge.md"
+    )
+    assert "preview" not in knowledge_summary
+    assert knowledge_summary["requires_explicit_preview"] is True
+    assert rejected.error_code == "KNOWLEDGE_NOT_REVIEWED"
+    assert previewed.ok is True
+    assert accepted.ok is True
+
+
+def test_knowledge_detection_is_case_insensitive(tmp_path):
+    task = _task(tmp_path, knowledge=True)
+    (task.context_dir / "knowledge.md").rename(task.context_dir / "Knowledge.MD")
+    tools = _ExplorerTools(config=ExplorerConfig())
+    inspected = tools.inspect(task, InspectFilesInput())
+    previewed = tools.preview(task, PreviewFileInput(path="Knowledge.MD"))
+    accepted = tools.report(
+        task,
+        ExplorerReportInput.model_validate(
+            _report(
+                inspect_ref=inspected.content["evidence_id"],
+                knowledge_ref=previewed.content["evidence_id"],
+                knowledge_path="Knowledge.MD",
+            )
+        ),
+    )
+
+    assert previewed.ok is True
+    assert accepted.ok is True
+
+
+def test_knowledge_preview_failure_can_be_reported_as_evidence_warning(tmp_path, monkeypatch):
+    task = _task(tmp_path, knowledge=True)
+    tools = _ExplorerTools(config=ExplorerConfig())
+    inspected = tools.inspect(task, InspectFilesInput())
+
+    def fail_preview(*_args, **_kwargs):
+        raise OSError("unreadable")
+
+    monkeypatch.setattr(
+        "data_agent_baseline.exploration.runner.preview_context_file",
+        fail_preview,
+    )
+    failed = tools.preview(task, PreviewFileInput(path="knowledge.md"))
+    report = _report(inspect_ref=inspected.content["evidence_id"])
+    report["files"].append(
+        {
+            "path": "knowledge.md",
+            "format": "markdown",
+            "row_count": None,
+            "evidence_refs": [inspected.content["evidence_id"]],
+        }
+    )
+    report["warnings"].append(
+        {
+            "path": "knowledge.md",
+            "message": "knowledge.md could not be read.",
+            "evidence_refs": [failed.content["evidence"]["evidence_id"]],
+        }
+    )
+    accepted = tools.report(task, ExplorerReportInput.model_validate(report))
+
+    assert failed.error_code == "PREVIEW_FAILED"
+    assert accepted.ok is True
+
+
+def test_preview_requires_inspection_known_path_and_budget(tmp_path):
+    task = _task(tmp_path)
+    tools = _ExplorerTools(config=ExplorerConfig(max_preview_calls=1))
+
+    before_inspect = tools.preview(task, PreviewFileInput(path="sales.csv"))
+    tools.inspect(task, InspectFilesInput())
     first = tools.preview(task, PreviewFileInput(path="sales.csv"))
     second = tools.preview(task, PreviewFileInput(path="sales.csv"))
     outside = tools.preview(task, PreviewFileInput(path="../outside.csv"))
 
+    assert before_inspect.error_code == "INSPECT_REQUIRED"
     assert first.ok is True
     assert first.content["observation"]["summary"]["sample_row_count"] == 3
     assert second.error_code == "PREVIEW_BUDGET_EXHAUSTED"
-    assert outside.error_code == "PATH_NOT_SELECTED"
+    assert outside.error_code == "PATH_NOT_INSPECTED"
 
 
-def test_report_rejects_unknown_evidence_and_unselected_paths(tmp_path):
+def test_grep_context_searches_text_and_rejects_invalid_regex(tmp_path):
     task = _task(tmp_path)
-    config = ExplorerConfig()
-    tools = _ExplorerTools(
-        config=config,
-        inventory=_inventory(task, config),
-        candidate_paths=["sales.csv"],
-    )
+    tools = _ExplorerTools(config=ExplorerConfig())
+    tools.inspect(task, InspectFilesInput())
 
-    unknown_evidence = tools.report(
-        task,
-        ExplorerReportInput.model_validate(_report(evidence_ref="preview:99")),
-    )
-    unselected_path = _report(evidence_ref="inventory:1")
-    unselected_path["selected_sources"][0]["path"] = "other.csv"
-    invalid_path = tools.report(
-        task,
-        ExplorerReportInput.model_validate(unselected_path),
-    )
+    found = tools.grep(task, GrepContextInput(pattern="C[12]"))
+    invalid = tools.grep(task, GrepContextInput(pattern="["))
+    unsafe_filter = tools.grep(task, GrepContextInput(pattern="C1", path="../outside"))
 
-    assert unknown_evidence.error_code == "UNKNOWN_EVIDENCE_REF"
-    assert invalid_path.error_code == "REPORT_PATH_NOT_SELECTED"
+    assert found.ok is True
+    assert found.content["observation"]["match_count"] == 2
+    assert invalid.error_code == "INVALID_GREP_PATTERN"
+    assert unsafe_filter.error_code == "INVALID_PATH_FILTER"
 
 
-def test_report_validates_recommended_check_fields_against_evidence(tmp_path):
+def test_grep_context_searches_sqlite_and_obeys_file_byte_budget(tmp_path):
     task = _task(tmp_path)
-    config = ExplorerConfig()
+    database_path = task.context_dir / "0facts.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE facts (id INTEGER, value TEXT)")
+        connection.executemany("INSERT INTO facts VALUES (?, ?)", [(1, "Alpha"), (2, "Beta")])
+    context_bytes = sum(path.stat().st_size for path in task.context_dir.iterdir())
     tools = _ExplorerTools(
-        config=config,
-        inventory=_inventory(task, config),
-        candidate_paths=["sales.csv"],
+        config=ExplorerConfig(
+            max_single_file_bytes=database_path.stat().st_size,
+            max_total_read_bytes=context_bytes,
+        )
     )
-    payload = _report(evidence_ref="inventory:1")
-    payload["recommended_checks"] = [
+    tools.inspect(task, InspectFilesInput())
+
+    found = tools.grep(task, GrepContextInput(pattern="alpha", path="0facts.db"))
+    bounded_tools = _ExplorerTools(
+        config=ExplorerConfig(max_single_file_bytes=1, max_total_read_bytes=1)
+    )
+    bounded_tools.inspect(task, InspectFilesInput())
+    bounded = bounded_tools.grep(task, GrepContextInput(pattern="alpha", path="0facts.db"))
+
+    assert found.ok is True
+    assert found.content["observation"]["matches"][0]["table"] == "facts"
+    assert found.content["observation"]["read_bytes"] == database_path.stat().st_size
+    assert bounded.ok is True
+    assert bounded.content["observation"]["matches"] == []
+    assert bounded.content["observation"]["warnings"][0]["code"] == "GREP_FILE_TOO_LARGE"
+
+
+def test_grep_context_output_is_character_bounded(tmp_path):
+    task = _task(tmp_path)
+    (task.context_dir / "long.txt").write_text(
+        "\n".join(f"match-{index}-{'x' * 500}" for index in range(30)),
+        encoding="utf-8",
+    )
+    tools = _ExplorerTools(config=ExplorerConfig(max_inventory_chars=700))
+    tools.inspect(task, InspectFilesInput())
+
+    result = tools.grep(task, GrepContextInput(pattern="match"))
+
+    assert result.ok is True
+    observation = result.content["observation"]
+    assert len(json.dumps(observation, ensure_ascii=False, separators=(",", ":"))) <= 700
+    assert observation["truncated"] is True
+
+
+def test_explorer_sql_is_read_only_and_evidence_backed(tmp_path):
+    task = _task(tmp_path)
+    database_path = task.context_dir / "facts.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE facts (id INTEGER, value TEXT)")
+        connection.executemany("INSERT INTO facts VALUES (?, ?)", [(1, "a"), (2, "b")])
+    tools = _ExplorerTools(config=ExplorerConfig())
+    tools.inspect(task, InspectFilesInput())
+
+    selected = tools.sql(
+        task,
+        ExplorerSqlInput(path="facts.db", sql="SELECT id, value FROM facts", limit=2),
+    )
+    explained = tools.sql(
+        task,
+        ExplorerSqlInput(
+            path="facts.db",
+            sql="EXPLAIN QUERY PLAN SELECT * FROM facts WHERE id = 1",
+        ),
+    )
+    rejected = tools.sql(
+        task,
+        ExplorerSqlInput(path="facts.db", sql="DELETE FROM facts"),
+    )
+    pragma = tools.sql(
+        task,
+        ExplorerSqlInput(path="facts.db", sql="PRAGMA table_info(facts)"),
+    )
+    multi_statement = tools.sql(
+        task,
+        ExplorerSqlInput(path="facts.db", sql="SELECT 1; SELECT 2"),
+    )
+    non_sqlite = tools.sql(
+        task,
+        ExplorerSqlInput(path="sales.csv", sql="SELECT 1"),
+    )
+
+    assert selected.ok is True
+    assert selected.content["evidence_id"] == "sql:1"
+    assert explained.ok is True
+    assert pragma.ok is True
+    assert rejected.error_code == "EXPLORATION_SQL_ERROR"
+    assert multi_statement.error_code == "EXPLORATION_SQL_ERROR"
+    assert non_sqlite.error_code == "NOT_SQLITE"
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 2
+
+
+def test_explorer_sql_output_is_character_bounded(tmp_path):
+    task = _task(tmp_path)
+    database_path = task.context_dir / "large.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE facts (value TEXT)")
+        connection.execute("INSERT INTO facts VALUES (?)", ("x" * 20_000,))
+    tools = _ExplorerTools(config=ExplorerConfig(max_inventory_chars=500))
+    tools.inspect(task, InspectFilesInput())
+
+    result = tools.sql(
+        task,
+        ExplorerSqlInput(path="large.db", sql="SELECT value FROM facts"),
+    )
+
+    assert result.ok is True
+    observation = result.content["observation"]
+    assert len(json.dumps(observation, ensure_ascii=False, separators=(",", ":"))) <= 500
+    assert observation["truncated"] is True
+
+
+def test_report_rejects_unknown_path_evidence_and_join_field(tmp_path):
+    task = _task(tmp_path)
+    tools = _ExplorerTools(config=ExplorerConfig())
+    inspected = tools.inspect(task, InspectFilesInput())
+    inspect_ref = inspected.content["evidence_id"]
+
+    unknown_path = _report(inspect_ref=inspect_ref)
+    unknown_path["files"][0]["path"] = "missing.csv"
+    path_result = tools.report(task, ExplorerReportInput.model_validate(unknown_path))
+
+    unknown_evidence = _report(inspect_ref="inspect:99")
+    evidence_result = tools.report(task, ExplorerReportInput.model_validate(unknown_evidence))
+
+    unknown_field = _report(inspect_ref=inspect_ref)
+    unknown_field["join_paths"] = [
         {
-            "check_type": "filter_domain",
-            "paths": ["sales.csv"],
-            "fields": [{"path": "sales.csv", "field": "amount", "table": None}],
-            "instruction": "Confirm the complete amount domain before filtering.",
-            "evidence_refs": ["inventory:1"],
+            "status": "candidate",
+            "left": {"path": "sales.csv", "field": "missing", "table": None},
+            "right": {"path": "sales.csv", "field": "amount", "table": None},
+            "evidence_refs": [inspect_ref],
         }
     ]
+    field_result = tools.report(task, ExplorerReportInput.model_validate(unknown_field))
 
-    valid = tools.report(task, ExplorerReportInput.model_validate(payload))
-    payload["recommended_checks"][0]["fields"][0]["field"] = "invented"
-    invalid = tools.report(task, ExplorerReportInput.model_validate(payload))
-
-    assert valid.ok is True
-    assert invalid.error_code == "UNKNOWN_FIELD_REF"
+    assert path_result.error_code == "UNKNOWN_REPORT_PATH"
+    assert evidence_result.error_code == "UNKNOWN_EVIDENCE_REF"
+    assert field_result.error_code == "UNKNOWN_FIELD_REF"
 
 
-def test_report_schema_cannot_overwrite_inventory():
-    payload = _report(evidence_ref="inventory:1")
-    payload["inventory"] = {"files": []}
-
-    with pytest.raises(ValidationError):
-        ExplorerReportInput.model_validate(payload)
-
-
-def test_explore_tool_rejects_paths_missing_from_inventory(tmp_path):
+def test_final_turn_without_report_and_model_failure_use_inspection_fallback(tmp_path):
     task = _task(tmp_path)
-    config = ExplorerConfig()
-    model = ScriptedModelAdapter([])
-    registry = ToolRegistry(
-        specs={
-            "explore": create_explorer_tool_spec(
-                model=model,
-                config=config,
-                inventory=_inventory(task, config),
-            )
-        }
-    )
-    result = registry.execute(
-        task,
-        ModelToolCall(
-            id="invalid_path",
-            name="explore",
-            arguments=json.dumps(
-                {
-                    "focus": "Inspect another file.",
-                    "candidate_paths": ["../outside.csv"],
-                }
-            ),
+    final_missing = ExplorerRunner(
+        model=ScriptedModelAdapter(
+            [
+                _single_response("inspect_files", {}, "inspect"),
+                _single_response("preview_file", {"path": "sales.csv"}, "late"),
+            ]
         ),
-    )
+        config=ExplorerConfig(max_steps=2),
+    ).run(task, ExploreInput())
 
-    assert result.error_code == "INVALID_CANDIDATE_PATH"
-    assert model.requests == []
+    model_failure = ExplorerRunner(
+        model=ScriptedModelAdapter([_single_response("inspect_files", {}, "inspect")]),
+        config=ExplorerConfig(max_steps=3),
+    ).run(task, ExploreInput())
+
+    assert final_missing.fallback_used is True
+    assert final_missing.report["files"][0]["path"] == "sales.csv"
+    assert model_failure.fallback_used is True
+    assert model_failure.evidence[0]["source_tool"] == "inspect_files"
 
 
-def test_explore_tool_requires_exact_inventory_request_when_recommended(tmp_path):
+def test_fallback_report_respects_character_budget(tmp_path):
     task = _task(tmp_path)
-    config = ExplorerConfig()
-    inventory = _inventory(task, config)
-    inventory["exploration"] = {
-        "recommended": True,
-        "focus": "Resolve the supplied ambiguity.",
-        "candidate_paths": ["sales.csv"],
-        "ambiguity_codes": ["TEST_AMBIGUITY"],
-    }
-    registry = ToolRegistry(
-        specs={
-            "explore": create_explorer_tool_spec(
-                model=ScriptedModelAdapter([]),
-                config=config,
-                inventory=inventory,
-            )
-        }
-    )
+    for index in range(30):
+        (task.context_dir / f"extra-{index:02d}.csv").write_text(
+            "id,value\n1,alpha\n",
+            encoding="utf-8",
+        )
+    model = ScriptedModelAdapter(responses=[_single_response("inspect_files", {}, "inspect")])
 
-    result = registry.execute(
-        task,
-        ModelToolCall(
-            id="mismatch",
-            name="explore",
-            arguments=json.dumps(
-                {
-                    "focus": "Different focus.",
-                    "candidate_paths": ["sales.csv"],
-                }
-            ),
-        ),
-    )
-
-    assert result.error_code == "EXPLORATION_REQUEST_MISMATCH"
-
-
-def test_main_agent_can_skip_explore_when_inventory_is_sufficient(tmp_path):
-    task = _task(tmp_path)
-    inventory = _inventory(task)
-    model = ScriptedModelAdapter(
-        [_response("answer", {"columns": ["amount"], "rows": [["10"]]}, "main_answer")]
-    )
-    agent = ReActAgent(
+    result = ExplorerRunner(
         model=model,
-        tools=create_default_tool_registry(),
-        context_inventory=inventory,
+        config=ExplorerConfig(max_report_chars=1_000),
+    ).run(task, ExploreInput())
+
+    assert result.fallback_used is True
+    assert len(json.dumps(result.report, ensure_ascii=False, separators=(",", ":"))) <= 1_000
+
+
+def test_inspect_failure_immediately_fails_open(tmp_path, monkeypatch):
+    task = _task(tmp_path)
+    events = []
+    model = ScriptedModelAdapter(responses=[_single_response("inspect_files", {}, "inspect")])
+
+    def fail_inspection(*_args, **_kwargs):
+        raise OSError("unreadable")
+
+    monkeypatch.setattr(
+        "data_agent_baseline.exploration.runner.inspect_context",
+        fail_inspection,
     )
 
-    result = agent.run(task)
+    result = ExplorerRunner(
+        model=model,
+        config=ExplorerConfig(),
+        event_sink=lambda kind, payload: events.append((kind, payload)),
+    ).run(task, ExploreInput())
 
-    assert result.succeeded is True
-    assert [step.action for step in result.steps] == ["answer"]
-    assert "Context Inventory" in model.requests[0][1].content
-    assert "sales.csv" in model.requests[0][1].content
+    assert result.success is False
+    assert result.fallback_used is True
+    assert result.steps_used == 1
+    assert any(kind == "explorer_inspection_failed" for kind, _ in events)
+    assert any(
+        kind == "explorer_completed" and payload["fallback_used"] is True
+        for kind, payload in events
+    )
 
 
-def test_main_agent_can_call_focused_explore_then_answer_with_matching_ids(tmp_path):
+def test_soft_deadline_fails_open_without_model_request(tmp_path):
     task = _task(tmp_path)
-    config = ExplorerConfig(max_steps=2, max_preview_calls=1)
-    inventory = _inventory(task, config)
+    model = ScriptedModelAdapter([])
+    events = []
+
+    result = ExplorerRunner(
+        model=model,
+        config=ExplorerConfig(max_duration_seconds=0),
+        event_sink=lambda kind, payload: events.append((kind, payload)),
+    ).run(task, ExploreInput())
+
+    assert result.fallback_used is True
+    assert result.success is False
+    assert model.requests == []
+    fallback = next(payload for kind, payload in events if kind == "explorer_fallback_used")
+    assert fallback["reason_code"] == "SOFT_TIMEOUT"
+
+
+def test_main_agent_calls_no_argument_explore_once_then_restores_tools(tmp_path):
+    task = _task(tmp_path)
     model = ScriptedModelAdapter(
         [
-            _response(
-                "explore",
-                {
-                    "focus": "Confirm the sales amount field.",
-                    "candidate_paths": ["sales.csv"],
-                },
-                "main_explore",
-            ),
-            _response("preview_file", {"path": "sales.csv"}, "explore_preview"),
-            _response("report", _report(), "explore_report"),
-            _response(
+            _single_response("explore", {}, "main_explore"),
+            _single_response("inspect_files", {}, "inspect"),
+            _single_response("report", _report(), "report"),
+            _single_response("explore", {}, "repeated_explore"),
+            _single_response(
                 "answer",
                 {"columns": ["amount"], "rows": [["10"]]},
                 "main_answer",
@@ -398,125 +582,41 @@ def test_main_agent_can_call_focused_explore_then_answer_with_matching_ids(tmp_p
     specs = dict(base_registry.specs)
     specs["explore"] = create_explorer_tool_spec(
         model=model,
-        config=config,
-        inventory=inventory,
+        config=ExplorerConfig(max_steps=2),
     )
-    agent = ReActAgent(
-        model=model,
-        tools=ToolRegistry(specs=specs),
-        context_inventory=inventory,
-    )
+    agent = ReActAgent(model=model, tools=ToolRegistry(specs=specs))
 
     result = agent.run(task)
 
     assert result.succeeded is True
-    assert [step.action for step in result.steps] == ["explore", "answer"]
+    assert [step.action for step in result.steps] == ["explore", "explore", "answer"]
     assert result.steps[0].tool_call_id == "main_explore"
-    assert model.requests[-1][-1].tool_call_id == "main_explore"
+    assert result.steps[1].observation["content"]["error"]["code"] == "UNKNOWN_TOOL"
+    assert model.requested_tool_names[0] == ("explore",)
+    assert "explore" not in model.requested_tool_names[3]
+    assert model.requests[3][-1].tool_call_id == "main_explore"
 
 
-def test_runner_injects_inventory_without_forcing_explorer(tmp_path):
+def test_runner_forces_explore_without_injecting_inventory(tmp_path):
     task = _task(tmp_path)
-    (task.task_dir / "task.json").write_text(
-        json.dumps(
-            {
-                "task_id": "task_1",
-                "difficulty": "easy",
-                "question": "Find sales.",
-            }
-        ),
-        encoding="utf-8",
-    )
-    config = AppConfig(
-        dataset=DatasetConfig(root_path=tmp_path),
-        agent=AgentConfig(api_key="test-key"),
-        run=RunConfig(output_dir=tmp_path / "runs", run_id="explorer-run", max_workers=1),
-    )
-    model = ScriptedModelAdapter(
-        [_response("answer", {"columns": ["amount"], "rows": [["10"]]}, "main_answer")]
-    )
-
-    run_output_dir, artifacts = run_benchmark(
-        config=config,
-        model=model,
-        task_ids=["task_1"],
-    )
-
-    assert artifacts[0].succeeded is True
-    assert "Context Inventory" in model.requests[0][1].content
-    assert "`explore`" not in model.requests[0][0].content
-    events = [
-        json.loads(line)
-        for line in (run_output_dir / "task_1" / "events.jsonl")
-        .read_text(encoding="utf-8")
-        .splitlines()
-    ]
-    created = next(event for event in events if event["event_type"] == "context_inventory_created")
-    assert created["file_count"] == 1
-    assert created["prompt_chars"] <= config.explorer.max_prompt_inventory_chars
-    assert created["exploration_recommended"] is False
-    assert created["ambiguity_count"] == 0
-    assert created["relation_candidate_count"] == 0
-    assert not any(event["event_type"] == "explorer_started" for event in events)
-
-
-def test_runner_requires_one_explore_then_removes_tool_for_recommended_inventory(tmp_path):
-    task = _task(tmp_path)
-    columns = [f"field_{index}" for index in range(20)]
-    (task.context_dir / "wide.csv").write_text(
-        ",".join(columns) + "\n" + ",".join(str(index) for index in range(20)) + "\n",
-        encoding="utf-8",
-    )
-    (task.task_dir / "task.json").write_text(
-        json.dumps(
-            {
-                "task_id": "task_1",
-                "difficulty": "easy",
-                "question": "Find sales.",
-            }
-        ),
-        encoding="utf-8",
-    )
-    explorer_config = ExplorerConfig()
-    inventory = _inventory(task, explorer_config)
-    exploration = inventory["exploration"]
-    assert exploration["recommended"] is True
-    empty_report = {
-        "selected_sources": [],
-        "evidence_refs": [],
-        "key_fields": [],
-        "join_candidates": [],
-        "recommended_checks": [],
-        "etl_candidates": [],
-        "warnings": [],
-        "uncertainties": [],
-    }
+    _write_task_json(task)
     model = ScriptedModelAdapter(
         [
-            _response(
-                "explore",
-                {
-                    "focus": exploration["focus"],
-                    "candidate_paths": exploration["candidate_paths"],
-                },
-                "main_explore",
+            _single_response("explore", {}, "main_explore"),
+            _single_response("inspect_files", {}, "inspect"),
+            _single_response("report", _report(), "report"),
+            _single_response(
+                "answer",
+                {"columns": ["amount"], "rows": [["10"]]},
+                "main_answer",
             ),
-            _response("report", empty_report, "explorer_report"),
-            _response(
-                "explore",
-                {
-                    "focus": exploration["focus"],
-                    "candidate_paths": exploration["candidate_paths"],
-                },
-                "repeated_explore",
-            ),
-            _response("answer", {"columns": ["amount"], "rows": [["10"]]}, "main_answer"),
         ]
     )
     config = AppConfig(
         dataset=DatasetConfig(root_path=tmp_path),
         agent=AgentConfig(api_key="test-key"),
-        run=RunConfig(output_dir=tmp_path / "runs", run_id="required-explorer", max_workers=1),
+        run=RunConfig(output_dir=tmp_path / "runs", run_id="explorer-run", max_workers=1),
+        explorer=AppExplorerConfig(max_steps=2),
     )
 
     run_output_dir, artifacts = run_benchmark(
@@ -525,98 +625,33 @@ def test_runner_requires_one_explore_then_removes_tool_for_recommended_inventory
         task_ids=["task_1"],
     )
 
-    trace = json.loads(artifacts[0].trace_path.read_text(encoding="utf-8"))
     assert artifacts[0].succeeded is True
-    assert [step["action"] for step in trace["steps"]] == ["explore", "explore", "answer"]
-    assert trace["steps"][0]["tool_call_id"] == "main_explore"
-    assert trace["steps"][1]["observation"]["content"]["error"]["code"] == "UNKNOWN_TOOL"
+    assert "Context Inventory" not in model.requests[0][1].content
     assert model.requested_tool_names[0] == ("explore",)
-    assert "explore" not in model.requested_tool_names[2]
-    assert "answer" in model.requested_tool_names[2]
     events = [
         json.loads(line)
-        for line in (run_output_dir / "task_1" / "events.jsonl")
-        .read_text(encoding="utf-8")
-        .splitlines()
+        for line in (run_output_dir / "task_1" / "events.jsonl").read_text().splitlines()
     ]
     assert sum(event["event_type"] == "explorer_started" for event in events) == 1
-    created = next(event for event in events if event["event_type"] == "context_inventory_created")
-    assert created["exploration_recommended"] is True
+    assert sum(event["event_type"] == "explorer_inspection_created" for event in events) == 1
+    assert not any(event["event_type"].startswith("context_inventory") for event in events)
 
 
-def test_runner_inventory_failure_is_recorded_and_main_agent_continues(
-    tmp_path,
-    monkeypatch,
-):
+def test_disabled_explorer_restores_master_prompt_and_tools(tmp_path):
     task = _task(tmp_path)
-    (task.task_dir / "task.json").write_text(
-        json.dumps(
-            {
-                "task_id": "task_1",
-                "difficulty": "easy",
-                "question": "Find sales.",
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    def fail_inventory(*_args, **_kwargs):
-        raise OSError("inventory unavailable")
-
-    monkeypatch.setattr(
-        "data_agent_baseline.run.runner.inspect_context",
-        fail_inventory,
-    )
-    config = AppConfig(
-        dataset=DatasetConfig(root_path=tmp_path),
-        agent=AgentConfig(api_key="test-key"),
-        run=RunConfig(output_dir=tmp_path / "runs", run_id="failed-inventory", max_workers=1),
-    )
+    _write_task_json(task)
     model = ScriptedModelAdapter(
-        [_response("answer", {"columns": ["amount"], "rows": [["10"]]}, "main_answer")]
-    )
-
-    run_output_dir, artifacts = run_benchmark(
-        config=config,
-        model=model,
-        task_ids=["task_1"],
-    )
-
-    assert artifacts[0].succeeded is True
-    assert "CONTEXT_INVENTORY_FAILED" in model.requests[0][1].content
-    events = [
-        json.loads(line)
-        for line in (run_output_dir / "task_1" / "events.jsonl")
-        .read_text(encoding="utf-8")
-        .splitlines()
-    ]
-    failed = next(event for event in events if event["event_type"] == "context_inventory_failed")
-    assert failed["error_type"] == "OSError"
-    assert "inventory unavailable" not in json.dumps(failed)
-
-
-def test_disabled_explorer_restores_prompt_without_inventory(tmp_path):
-    task = _task(tmp_path)
-    (task.task_dir / "task.json").write_text(
-        json.dumps(
-            {
-                "task_id": "task_1",
-                "difficulty": "easy",
-                "question": "Find sales.",
-            }
-        ),
-        encoding="utf-8",
+        [_single_response("answer", {"columns": ["amount"], "rows": [["10"]]}, "answer")]
     )
     config = AppConfig(
         dataset=DatasetConfig(root_path=tmp_path),
         agent=AgentConfig(api_key="test-key"),
-        run=RunConfig(output_dir=tmp_path / "runs", run_id="no-explorer", max_workers=1),
+        run=RunConfig(output_dir=tmp_path / "runs", run_id="disabled", max_workers=1),
         explorer=AppExplorerConfig(enabled=False),
     )
-    model = ScriptedModelAdapter(
-        [_response("answer", {"columns": ["amount"], "rows": [["10"]]}, "main_answer")]
-    )
 
-    run_benchmark(config=config, model=model, task_ids=["task_1"])
+    _, artifacts = run_benchmark(config=config, model=model, task_ids=["task_1"])
 
+    assert artifacts[0].succeeded is True
+    assert "explore" not in model.requested_tool_names[0]
     assert "Context Inventory" not in model.requests[0][1].content

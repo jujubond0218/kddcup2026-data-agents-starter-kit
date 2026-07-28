@@ -1,39 +1,55 @@
-# Phase 1 受限 Context Explorer
+# Phase 1 Context Explorer
 
-本次改造在主 Agent 首次请求模型前生成确定性 Context Inventory，并将其紧凑视图直接
-注入任务上下文，不消耗 ReAct 步骤。`explore` 保留为可选的定向工具：只有 Inventory
-无法解决具体的数据源、字段语义、连接或文档映射歧义时，主 Agent 才传入 `focus` 和
-Inventory 中的 `candidate_paths` 启动受限子 Agent。
+当前实现采用与参考项目 Phase 1 发现流程一致的子 Agent 工作流，不再在主 Agent 请求模型
+前自动生成或注入 Inventory，也不再由本地规则判断“歧义”。启用 Explorer 时，主 Agent
+首轮只开放无参数 `explore({})`；子 Agent 的首个成功轮次必须单独调用
+`inspect_files({})`，随后按需调用 `preview_file`、`grep_context` 和只读
+`execute_context_sql`，最后以独占一轮的 `report` 提交数据地图。完成或 fail-open 后，
+主 Agent 永久移除 `explore` 并恢复原有工具。
 
-## 边界与预算
+## 子 Agent 工具与数据地图
 
-Inventory 扫描覆盖 CSV/TSV、JSON、SQLite、Markdown、文本和
-文本型 PDF；默认最多扫描 64 个文件、读取 4 MiB、普通单文件读取 256 KiB、PDF 读取
-2 MiB 的前三页。完整 Inventory 最多 12,000 字符，首次 Prompt 视图最多 6,000 字符。
-Explorer 最多三次模型请求、两次定向 `preview_file`，报告最多 4,000 字符；它不执行
-Python、不执行 SQL、不进行 OCR、不写 ETL 产物，也不处理视频或 Phase 2。
+`inspect_files` 是确定性、有预算的子 Agent 工具，覆盖 CSV/TSV、JSON、SQLite、
+Markdown、文本和文本型 PDF，返回相对路径、类型、大小、schema、行数、字段画像、
+文档标题、warning 和候选关系。它只负责收集事实，不判断是否存在歧义，也不直接把
+`knowledge.md` 正文放进结果；如果扫描发现一个或多个大小写不敏感的 `knowledge.md`，
+子 Agent 必须对每个文件显式调用 `preview_file`。未尝试读取会以可恢复的
+`KNOWLEDGE_NOT_REVIEWED` 拒绝报告；读取失败则保留 warning evidence 并允许继续报告。
 
-所有扫描路径均限制在任务 `context/` 内。损坏、超限、无文本 PDF、外逃路径和不支持类型
-会产生结构化 warning。Inventory 整体失败时，Runner 注入失败 warning，主 Agent 继续使用
-基础工具。Explorer 无法提交报告或模型请求失败时，以已缓存的 Inventory evidence 返回
-fail-open 报告。
+`preview_file` 对 inspect 已发现的单个文件做更深入但有界的读取。`grep_context` 在文本
+来源和 SQLite 文本列中执行大小写不敏感的有界正则搜索；可选路径过滤仍只能选择 inspect
+发现的相对路径。Explorer 内的 `execute_context_sql` 仅允许单条 `SELECT`、`WITH`、只读
+`PRAGMA` 或 `EXPLAIN`，最多返回 200 行，并通过只读连接、`query_only`、语句校验和执行
+时限共同拒绝写入、ATTACH、建索引及长时间查询。
 
-Explorer 正常报告使用 evidence-first 契约：`selected_sources`、`evidence_refs`、
-`key_fields`、`join_candidates`、`etl_candidates`、`warnings` 和 `uncertainties`。
-preview observation 由运行时分配不可伪造的 evidence ID；报告只能引用实际存在的
-evidence。Inventory 与 observation 是事实，字段和连接 candidate 必须由主 Agent 在计算前
-验证，报告不能覆盖 Inventory。
+报告 schema 为 `files`、`schema_map`、`knowledge`、`etl_candidates`、`join_paths`、
+`value_samples` 和 `warnings`。所有知识规则、值样本、连接与 warning 都必须引用真实的
+inspect/preview/grep/SQL evidence ID；所有连接始终标记为 candidate。`etl_candidates`
+仅是咨询性发现，本 PR 不执行 ETL，也不因没有 ETL 产物拒绝报告。
 
-## 兼容性与评测
+## 预算、协议与 fail-open
 
-`explore` 仍是普通原生工具调用，主 Agent 按原始 `tool_call_id` 接收 observation；主
-`trace.json` 将其记录为普通步骤，`events.jsonl` 增加 Explorer 生命周期事件。现有 Runner
-的 120 秒任务硬超时、重试、恢复与失败重跑不改变。
+Explorer 默认最多 10 个模型轮次，软墙钟上限为 60 秒；10 轮是复杂任务的硬上限，不是
+期望平均值。`inspect_files` 与 `report` 必须各自独占一轮；中间轮次最多包含两个独立
+发现工具调用，运行时按原顺序执行，并为每个调用返回匹配原始 `tool_call_id` 的独立
+observation。主 Agent 的“一轮一个工具”协议不变。
 
-主 Agent 默认步数从 16 增至 20。`context_inventory_created` 和
-`context_inventory_failed` 事件只记录文件数、warning 数、截断、字符和读字节等聚合信息，
-不记录 Inventory 内容。最终 50 题实验只能衡量此目标方案的整体观测结果；真实服务存在
-波动，单轮实验不构成稳定因果结论。
+扫描默认最多处理 64 个文件、总读取 4 MiB、普通单文件 256 KiB，文本型 PDF 最多读取
+2 MiB 和前三页；inspect 结果最多 12,000 字符，单个 preview 最多 2,000 字符，正常报告
+最多 4,000 字符且 preview 最多两次。所有路径限制在任务 `context/` 内。损坏文件、非法
+正则、越权路径、超限与不支持输入返回结构化可恢复错误或 warning。
+
+若模型失败、10 轮内没有合法 report、子工具失败或到达 60 秒软时限，运行时使用已经成功
+取得的 inspect/preview/grep/SQL observation 合成有界 fallback 数据地图；没有证据时也
+返回结构化失败，然后恢复主 Agent 原工具。Explorer 生命周期和工具聚合信息写入
+`events.jsonl`，不写原始报告或样本；主 Trace、模型请求超时与重试、120 秒任务硬超时、
+恢复和失败重跑语义保持不变。
+
+## 历史实验
+
+下述 v1、v2 和 bad-case 定向增强结果是已淘汰设计的历史记录，用于解释为何移除自动
+Inventory、歧义规则和要求模型复制 `focus/candidate_paths` 的接口。它们不能代表当前
+工作流对齐版本的结果；当前版本必须先通过固定 9 题门槛，才会运行一次 50 题实验。
 
 ## 50 题实验结果
 

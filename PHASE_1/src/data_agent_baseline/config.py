@@ -44,12 +44,12 @@ class RunConfig:
 @dataclass(frozen=True, slots=True)
 class ExplorerConfig:
     enabled: bool = True
-    max_steps: int = 3
+    max_steps: int = 10
+    max_duration_seconds: float = 60.0
     max_files: int = 64
     max_preview_calls: int = 2
     max_preview_chars: int = 2_000
     max_inventory_chars: int = 12_000
-    max_prompt_inventory_chars: int = 6_000
     max_report_chars: int = 4_000
     max_total_read_bytes: int = 4 * 1024 * 1024
     max_single_file_bytes: int = 256 * 1024
@@ -128,6 +128,12 @@ def load_app_config(config_path: Path) -> AppConfig:
     explorer_config = ExplorerConfig(
         enabled=bool(explorer_payload.get("enabled", explorer_defaults.enabled)),
         max_steps=int(explorer_payload.get("max_steps", explorer_defaults.max_steps)),
+        max_duration_seconds=float(
+            explorer_payload.get(
+                "max_duration_seconds",
+                explorer_defaults.max_duration_seconds,
+            )
+        ),
         max_files=int(explorer_payload.get("max_files", explorer_defaults.max_files)),
         max_preview_calls=int(
             explorer_payload.get("max_preview_calls", explorer_defaults.max_preview_calls)
@@ -137,12 +143,6 @@ def load_app_config(config_path: Path) -> AppConfig:
         ),
         max_inventory_chars=int(
             explorer_payload.get("max_inventory_chars", explorer_defaults.max_inventory_chars)
-        ),
-        max_prompt_inventory_chars=int(
-            explorer_payload.get(
-                "max_prompt_inventory_chars",
-                explorer_defaults.max_prompt_inventory_chars,
-            )
         ),
         max_report_chars=int(
             explorer_payload.get("max_report_chars", explorer_defaults.max_report_chars)

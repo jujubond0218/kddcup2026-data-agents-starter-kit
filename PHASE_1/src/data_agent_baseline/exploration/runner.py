@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from time import monotonic
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 from data_agent_baseline.agents.model import (
     ModelAdapter,
@@ -16,9 +17,13 @@ from data_agent_baseline.benchmark.schema import PublicTask
 from data_agent_baseline.events import EventSink, emit_event
 from data_agent_baseline.exploration.inventory import (
     InventoryLimits,
+    inspect_context,
     preview_context_file,
 )
+from data_agent_baseline.exploration.search import grep_context
+from data_agent_baseline.tools.filesystem import resolve_context_path
 from data_agent_baseline.tools.registry import ToolExecutionResult, ToolRegistry, ToolSpec
+from data_agent_baseline.tools.sqlite import execute_exploration_sql
 
 
 class _StrictInput(BaseModel):
@@ -26,39 +31,55 @@ class _StrictInput(BaseModel):
 
 
 class ExploreInput(_StrictInput):
-    focus: str = Field(min_length=1, max_length=500)
-    candidate_paths: list[str] = Field(min_length=1, max_length=8)
+    pass
 
-    @field_validator("focus")
-    @classmethod
-    def _focus_must_not_be_blank(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("focus must not be blank")
-        return value
 
-    @field_validator("candidate_paths")
-    @classmethod
-    def _candidate_paths_must_be_unique(cls, value: list[str]) -> list[str]:
-        if len(set(value)) != len(value):
-            raise ValueError("candidate_paths must not contain duplicates")
-        return value
+class InspectFilesInput(_StrictInput):
+    pass
 
 
 class PreviewFileInput(_StrictInput):
-    path: str = Field(description="Path relative to the task context directory.")
+    path: str = Field(min_length=1, max_length=500)
 
 
-class EvidenceBackedSource(_StrictInput):
+class GrepContextInput(_StrictInput):
+    pattern: str = Field(min_length=1, max_length=200)
+    path: str | None = Field(default=None, min_length=1, max_length=500)
+
+
+class ExplorerSqlInput(_StrictInput):
+    path: str = Field(min_length=1, max_length=500)
+    sql: str = Field(min_length=1, max_length=4_000)
+    limit: int = Field(default=200, ge=1, le=200)
+
+
+class EvidenceFile(_StrictInput):
     path: str
-    reason: str = Field(min_length=1, max_length=300)
+    format: str
+    row_count: int | None = Field(default=None, ge=0)
     evidence_refs: list[str] = Field(min_length=1, max_length=8)
 
 
-class KeyField(_StrictInput):
+class SchemaEntry(_StrictInput):
     path: str
-    field: str = Field(min_length=1, max_length=200)
-    table: str | None = Field(default=None, max_length=200)
-    reason: str = Field(min_length=1, max_length=300)
+    table: str | None = None
+    columns: list[str] = Field(default_factory=list, max_length=64)
+    semantics: dict[str, str] = Field(default_factory=dict)
+    evidence_refs: list[str] = Field(min_length=1, max_length=8)
+
+
+class KnowledgeEntry(_StrictInput):
+    path: str
+    kind: Literal[
+        "field_mapping",
+        "formula",
+        "unit",
+        "value_mapping",
+        "disambiguation",
+        "example",
+        "other",
+    ]
+    text: str = Field(min_length=1, max_length=500)
     evidence_refs: list[str] = Field(min_length=1, max_length=8)
 
 
@@ -68,47 +89,49 @@ class FieldReference(_StrictInput):
     table: str | None = Field(default=None, max_length=200)
 
 
-class JoinCandidate(_StrictInput):
+class JoinPath(_StrictInput):
     status: Literal["candidate"] = "candidate"
     left: FieldReference
     right: FieldReference
+    evidence_refs: list[str] = Field(min_length=1, max_length=8)
+
+
+class EtlCandidate(_StrictInput):
+    path: str
     reason: str = Field(min_length=1, max_length=300)
     evidence_refs: list[str] = Field(min_length=1, max_length=8)
 
 
-class RecommendedCheck(_StrictInput):
-    check_type: Literal[
-        "source_relevance",
-        "field_semantics",
-        "join_coverage",
-        "filter_domain",
-    ]
-    paths: list[str] = Field(min_length=1, max_length=2)
-    fields: list[FieldReference] = Field(default_factory=list, max_length=4)
-    instruction: str = Field(min_length=1, max_length=300)
+class ValueSample(_StrictInput):
+    values: list[Any] = Field(max_length=20)
+    evidence_refs: list[str] = Field(min_length=1, max_length=8)
+
+
+class EvidenceWarning(_StrictInput):
+    path: str | None = None
+    message: str = Field(min_length=1, max_length=500)
     evidence_refs: list[str] = Field(min_length=1, max_length=8)
 
 
 class ExplorerReportInput(_StrictInput):
-    selected_sources: list[EvidenceBackedSource] = Field(default_factory=list, max_length=8)
-    evidence_refs: list[str] = Field(default_factory=list, max_length=16)
-    key_fields: list[KeyField] = Field(default_factory=list, max_length=24)
-    join_candidates: list[JoinCandidate] = Field(default_factory=list, max_length=12)
-    recommended_checks: list[RecommendedCheck] = Field(default_factory=list, max_length=8)
-    etl_candidates: list[EvidenceBackedSource] = Field(default_factory=list, max_length=8)
-    warnings: list[str] = Field(default_factory=list, max_length=12)
-    uncertainties: list[str] = Field(default_factory=list, max_length=8)
+    files: list[EvidenceFile] = Field(default_factory=list, max_length=64)
+    schema_map: dict[str, SchemaEntry] = Field(default_factory=dict)
+    knowledge: list[KnowledgeEntry] = Field(default_factory=list, max_length=24)
+    etl_candidates: list[EtlCandidate] = Field(default_factory=list, max_length=8)
+    join_paths: list[JoinPath] = Field(default_factory=list, max_length=12)
+    value_samples: dict[str, ValueSample] = Field(default_factory=dict)
+    warnings: list[EvidenceWarning] = Field(default_factory=list, max_length=12)
 
 
 @dataclass(frozen=True, slots=True)
 class ExplorerConfig:
     enabled: bool = True
-    max_steps: int = 3
+    max_steps: int = 10
+    max_duration_seconds: float = 60.0
     max_files: int = 64
     max_preview_calls: int = 2
     max_preview_chars: int = 2_000
     max_inventory_chars: int = 12_000
-    max_prompt_inventory_chars: int = 6_000
     max_report_chars: int = 4_000
     max_total_read_bytes: int = 4 * 1024 * 1024
     max_single_file_bytes: int = 256 * 1024
@@ -137,18 +160,24 @@ class ExplorerResult:
 
 
 EXPLORER_SYSTEM_PROMPT = """
-You are a bounded, evidence-first data-context Explorer. You do not solve the
-question and you do not scan the whole context.
+You are a Phase 1 data exploration specialist. You are discovery-only: map the
+data landscape and never calculate the final answer.
 
-The caller supplies a focus and deterministic inventory evidence for selected
-candidate paths. Use that evidence directly. You may preview at most two selected
-files when more evidence is necessary. Every claim in report must cite evidence
-IDs returned in the initial evidence or preview observations. File and field
-relationships are candidates, never established facts. Call report no later than
-your final turn. Do not calculate the final answer, execute Python or SQL, invent
-paths, or include unsupported recommendations. Return concrete recommended_checks
-when the main agent still needs to validate source relevance, field semantics,
-join coverage, or a filter domain. Checks never contain executable code or SQL.
+Workflow:
+1. Your first successful turn must call inspect_files({}) and no other tool.
+2. If inspect_files lists knowledge.md (case-insensitive), you must call
+   preview_file for every listed knowledge.md before report.
+3. Use at most two independent tools in one turn. Targeted preview_file,
+   grep_context, and read-only execute_context_sql calls may share a turn.
+4. report must be the only tool call in its turn and is the only normal way to
+   finish. Submit it as soon as required sources, fields, mappings, and candidate
+   joins are located.
+
+The report is a data map with files, schema_map, knowledge, advisory
+etl_candidates, candidate join_paths, value_samples, and objective warnings.
+Every semantic claim must cite immutable evidence IDs returned by tools.
+Observed data wins on conflict. Do not execute Python, write SQL, create indexes,
+perform ETL, give computation advice, or inspect anything outside context/.
 """.strip()
 
 
@@ -173,46 +202,110 @@ def _error_result(code: str, message: str) -> ToolExecutionResult:
     )
 
 
-def _inventory_entries(inventory: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    entries: dict[str, dict[str, Any]] = {}
-    for item in inventory.get("files", []):
-        if isinstance(item, dict) and isinstance(item.get("path"), str):
-            entries[item["path"]] = item
-    return entries
+def _summary_fields(summary: dict[str, Any]) -> set[tuple[str | None, str]]:
+    fields = {(None, str(column)) for column in summary.get("columns", [])}
+    fields.update((None, str(field)) for field in summary.get("field_paths", []))
+    fields.update((None, str(field)) for field in summary.get("keys", []))
+    for table in summary.get("tables", []):
+        table_name = str(table.get("name"))
+        fields.update(
+            (table_name, str(column.get("name")))
+            for column in table.get("columns", [])
+            if column.get("name") is not None
+        )
+    return fields
 
 
 class _ExplorerTools:
-    def __init__(
+    def __init__(self, *, config: ExplorerConfig, event_sink: EventSink | None = None) -> None:
+        self.config = config
+        self.event_sink = event_sink
+        self.inspect_attempted = False
+        self.inspect_completed = False
+        self.preview_calls = 0
+        self.grep_calls = 0
+        self.sql_calls = 0
+        self.discovered_paths: set[str] = set()
+        self.knowledge_paths: set[str] = set()
+        self.knowledge_attempted: set[str] = set()
+        self.knowledge_failures: set[str] = set()
+        self.evidence: dict[str, dict[str, Any]] = {}
+
+    def _add_evidence(
         self,
         *,
-        config: ExplorerConfig,
-        inventory: dict[str, Any],
-        candidate_paths: list[str],
-    ) -> None:
-        self.config = config
-        self.candidate_paths = tuple(candidate_paths)
-        self.preview_calls = 0
-        self.evidence: dict[str, dict[str, Any]] = {}
-        inventory_by_path = _inventory_entries(inventory)
-        for index, path in enumerate(self.candidate_paths, start=1):
-            item = inventory_by_path[path]
-            evidence_id = f"inventory:{index}"
-            self.evidence[evidence_id] = {
-                "evidence_id": evidence_id,
-                "source_tool": "context_inventory",
-                "path": path,
-                "kind": item.get("kind"),
-                "observation": item,
-            }
+        prefix: str,
+        source_tool: str,
+        observation: dict[str, Any],
+        path: str | None = None,
+    ) -> dict[str, Any]:
+        evidence_id = f"{prefix}:{sum(key.startswith(f'{prefix}:') for key in self.evidence) + 1}"
+        evidence = {
+            "evidence_id": evidence_id,
+            "source_tool": source_tool,
+            "path": path,
+            "observation": observation,
+        }
+        self.evidence[evidence_id] = evidence
+        return evidence
 
-    def initial_evidence(self) -> list[dict[str, Any]]:
-        return list(self.evidence.values())
+    def inspect(self, task: PublicTask, _: InspectFilesInput) -> ToolExecutionResult:
+        if self.inspect_attempted:
+            return _error_result("INSPECT_ALREADY_CALLED", "inspect_files may be called once.")
+        self.inspect_attempted = True
+        try:
+            inspection = inspect_context(task, self.config.inventory_limits())
+        except Exception as exc:  # noqa: BLE001
+            emit_event(
+                self.event_sink,
+                "explorer_inspection_failed",
+                {"error_type": type(exc).__name__},
+            )
+            return _error_result(
+                "INSPECT_FAILED",
+                f"inspect_files failed: {type(exc).__name__}.",
+            )
+        self.inspect_completed = True
+        self.discovered_paths = {
+            str(item["path"])
+            for item in inspection.get("files", [])
+            if isinstance(item, dict) and isinstance(item.get("path"), str)
+        }
+        self.knowledge_paths = {
+            path
+            for path in self.discovered_paths
+            if path.rsplit("/", 1)[-1].casefold() == "knowledge.md"
+        }
+        evidence = self._add_evidence(
+            prefix="inspect",
+            source_tool="inspect_files",
+            observation=inspection,
+        )
+        emit_event(
+            self.event_sink,
+            "explorer_inspection_created",
+            {
+                "file_count": len(self.discovered_paths),
+                "knowledge_file_count": len(self.knowledge_paths),
+                "warning_count": len(inspection.get("warnings", [])),
+                "read_bytes": inspection.get("budget", {}).get("read_bytes", 0),
+                "truncated": bool(inspection.get("truncated")),
+            },
+        )
+        return ToolExecutionResult(ok=True, content=evidence)
+
+    def _require_inspection(self) -> ToolExecutionResult | None:
+        if self.inspect_completed:
+            return None
+        return _error_result("INSPECT_REQUIRED", "Call inspect_files({}) successfully first.")
 
     def preview(self, task: PublicTask, arguments: PreviewFileInput) -> ToolExecutionResult:
-        if arguments.path not in self.candidate_paths:
+        if error := self._require_inspection():
+            return error
+        if arguments.path not in self.discovered_paths:
             return _error_result(
-                "PATH_NOT_SELECTED",
-                "preview_file path must be one of explore.candidate_paths.",
+                "PATH_NOT_INSPECTED",
+                "preview_file path must be listed by inspect_files.",
             )
         if self.preview_calls >= self.config.max_preview_calls:
             return _error_result(
@@ -220,132 +313,259 @@ class _ExplorerTools:
                 f"Explorer may preview at most {self.config.max_preview_calls} files.",
             )
         self.preview_calls += 1
-        preview = preview_context_file(
-            task,
-            arguments.path,
-            self.config.inventory_limits(),
-            self.config.max_preview_chars,
+        is_knowledge = arguments.path in self.knowledge_paths
+        if is_knowledge:
+            self.knowledge_attempted.add(arguments.path)
+        try:
+            preview = preview_context_file(
+                task,
+                arguments.path,
+                self.config.inventory_limits(),
+                self.config.max_preview_chars,
+            )
+        except Exception as exc:  # noqa: BLE001
+            if is_knowledge:
+                self.knowledge_failures.add(arguments.path)
+                emit_event(
+                    self.event_sink,
+                    "explorer_knowledge_reviewed",
+                    {"path": arguments.path, "ok": False, "error_type": type(exc).__name__},
+                )
+            evidence = self._add_evidence(
+                prefix="preview",
+                source_tool="preview_file",
+                path=arguments.path,
+                observation={
+                    "path": arguments.path,
+                    "warnings": [
+                        {
+                            "code": "PREVIEW_FAILED",
+                            "message": f"preview_file failed: {type(exc).__name__}.",
+                        }
+                    ],
+                },
+            )
+            return ToolExecutionResult(
+                ok=False,
+                content={
+                    "error": {
+                        "code": "PREVIEW_FAILED",
+                        "message": f"preview_file failed: {type(exc).__name__}.",
+                        "recoverable": True,
+                    },
+                    "evidence": evidence,
+                },
+                error_code="PREVIEW_FAILED",
+                recoverable=True,
+            )
+        evidence = self._add_evidence(
+            prefix="preview",
+            source_tool="preview_file",
+            path=arguments.path,
+            observation=preview,
         )
-        evidence_id = f"preview:{self.preview_calls}"
-        evidence = {
-            "evidence_id": evidence_id,
-            "source_tool": "preview_file",
-            "path": arguments.path,
-            "kind": preview.get("kind"),
-            "observation": preview,
-        }
-        self.evidence[evidence_id] = evidence
+        if is_knowledge:
+            emit_event(
+                self.event_sink,
+                "explorer_knowledge_reviewed",
+                {"path": arguments.path, "ok": True, "evidence_id": evidence["evidence_id"]},
+            )
+        return ToolExecutionResult(ok=True, content=evidence)
+
+    def grep(self, task: PublicTask, arguments: GrepContextInput) -> ToolExecutionResult:
+        if error := self._require_inspection():
+            return error
+        if arguments.path is not None:
+            if arguments.path.startswith(("/", "\\")) or ".." in arguments.path.split("/"):
+                return _error_result("INVALID_PATH_FILTER", "grep path filter must be relative.")
+            normalized_filter = arguments.path.rstrip("/")
+            if not any(
+                path == normalized_filter or path.startswith(f"{normalized_filter}/")
+                for path in self.discovered_paths
+            ):
+                return _error_result(
+                    "PATH_NOT_INSPECTED",
+                    "grep path filter must select a path listed by inspect_files.",
+                )
+        self.grep_calls += 1
+        try:
+            observation = grep_context(
+                task,
+                pattern=arguments.pattern,
+                path_filter=arguments.path,
+                max_results=30,
+                max_files=self.config.max_files,
+                max_total_read_bytes=self.config.max_total_read_bytes,
+                max_single_file_bytes=self.config.max_single_file_bytes,
+                max_output_chars=self.config.max_inventory_chars,
+            )
+        except ValueError as exc:
+            return _error_result("INVALID_GREP_PATTERN", str(exc))
+        evidence = self._add_evidence(
+            prefix="grep",
+            source_tool="grep_context",
+            observation=observation,
+        )
+        return ToolExecutionResult(ok=True, content=evidence)
+
+    def sql(self, task: PublicTask, arguments: ExplorerSqlInput) -> ToolExecutionResult:
+        if error := self._require_inspection():
+            return error
+        if arguments.path not in self.discovered_paths:
+            return _error_result(
+                "PATH_NOT_INSPECTED",
+                "execute_context_sql path must be listed by inspect_files.",
+            )
+        if not arguments.path.casefold().endswith((".db", ".sqlite", ".sqlite3")):
+            return _error_result(
+                "NOT_SQLITE",
+                "execute_context_sql requires a .db, .sqlite, or .sqlite3 file.",
+            )
+        self.sql_calls += 1
+        try:
+            path = resolve_context_path(task, arguments.path)
+            observation = execute_exploration_sql(
+                path,
+                arguments.sql,
+                limit=arguments.limit,
+                max_output_chars=self.config.max_inventory_chars,
+            )
+        except (OSError, ValueError) as exc:
+            return _error_result("EXPLORATION_SQL_ERROR", str(exc))
+        evidence = self._add_evidence(
+            prefix="sql",
+            source_tool="execute_context_sql",
+            path=arguments.path,
+            observation=observation,
+        )
         return ToolExecutionResult(ok=True, content=evidence)
 
     @staticmethod
-    def _referenced_paths(arguments: ExplorerReportInput) -> set[str]:
-        paths = {item.path for item in arguments.selected_sources}
-        paths.update(item.path for item in arguments.key_fields)
-        paths.update(item.path for item in arguments.etl_candidates)
-        for candidate in arguments.join_candidates:
-            paths.add(candidate.left.path)
-            paths.add(candidate.right.path)
-        for check in arguments.recommended_checks:
-            paths.update(check.paths)
-            paths.update(field.path for field in check.fields)
-        return paths
-
-    @staticmethod
-    def _referenced_evidence(arguments: ExplorerReportInput) -> set[str]:
-        refs = set(arguments.evidence_refs)
-        for item in arguments.selected_sources:
+    def _all_evidence_refs(arguments: ExplorerReportInput) -> set[str]:
+        refs: set[str] = set()
+        for item in arguments.files:
             refs.update(item.evidence_refs)
-        for item in arguments.key_fields:
+        for item in arguments.schema_map.values():
             refs.update(item.evidence_refs)
-        for item in arguments.join_candidates:
-            refs.update(item.evidence_refs)
-        for item in arguments.recommended_checks:
+        for item in arguments.knowledge:
             refs.update(item.evidence_refs)
         for item in arguments.etl_candidates:
+            refs.update(item.evidence_refs)
+        for item in arguments.join_paths:
+            refs.update(item.evidence_refs)
+        for item in arguments.value_samples.values():
+            refs.update(item.evidence_refs)
+        for item in arguments.warnings:
             refs.update(item.evidence_refs)
         return refs
 
     @staticmethod
-    def _summary_fields(summary: dict[str, Any]) -> set[tuple[str | None, str]]:
-        fields = {(None, str(column)) for column in summary.get("columns", [])}
-        fields.update((None, str(field)) for field in summary.get("field_paths", []))
-        fields.update((None, str(field)) for field in summary.get("keys", []))
-        for table in summary.get("tables", []):
-            table_name = str(table.get("name"))
-            fields.update(
-                (table_name, str(column.get("name")))
-                for column in table.get("columns", [])
-                if column.get("name") is not None
-            )
-        return fields
+    def _report_paths(arguments: ExplorerReportInput) -> set[str]:
+        paths = {item.path for item in arguments.files}
+        paths.update(item.path for item in arguments.schema_map.values())
+        paths.update(item.path for item in arguments.etl_candidates)
+        paths.update(item.path for item in arguments.knowledge)
+        paths.update(item.path for item in arguments.warnings if item.path is not None)
+        for item in arguments.join_paths:
+            paths.update((item.left.path, item.right.path))
+        return paths
 
     def _known_fields(self) -> dict[str, set[tuple[str | None, str]]]:
         known: dict[str, set[tuple[str | None, str]]] = {}
         for evidence in self.evidence.values():
-            path = evidence.get("path")
             observation = evidence.get("observation")
-            if not isinstance(path, str) or not isinstance(observation, dict):
+            if not isinstance(observation, dict):
                 continue
-            summary = observation.get("summary")
-            if isinstance(summary, dict):
-                known.setdefault(path, set()).update(self._summary_fields(summary))
+            if evidence["source_tool"] == "inspect_files":
+                for item in observation.get("files", []):
+                    if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+                        continue
+                    summary = item.get("summary")
+                    if isinstance(summary, dict):
+                        known.setdefault(item["path"], set()).update(_summary_fields(summary))
+            else:
+                path = evidence.get("path")
+                summary = observation.get("summary")
+                if isinstance(path, str) and isinstance(summary, dict):
+                    known.setdefault(path, set()).update(_summary_fields(summary))
+                if isinstance(path, str) and evidence["source_tool"] == "execute_context_sql":
+                    known.setdefault(path, set()).update(
+                        (None, str(column)) for column in observation.get("columns", [])
+                    )
         return known
 
-    @staticmethod
-    def _field_references(arguments: ExplorerReportInput) -> list[FieldReference]:
-        references = [
-            FieldReference(path=item.path, table=item.table, field=item.field)
-            for item in arguments.key_fields
-        ]
-        for candidate in arguments.join_candidates:
-            references.extend([candidate.left, candidate.right])
-        for check in arguments.recommended_checks:
-            references.extend(check.fields)
-        return references
-
-    def _unknown_field_references(
-        self,
-        arguments: ExplorerReportInput,
-    ) -> list[FieldReference]:
-        known = self._known_fields()
-        unknown = []
-        for reference in self._field_references(arguments):
-            available = known.get(reference.path, set())
-            exact = (reference.table, reference.field) in available
-            unqualified = reference.table is None and any(
-                field == reference.field for _, field in available
-            )
-            if not exact and not unqualified:
-                unknown.append(reference)
-        return unknown
-
     def report(self, _: PublicTask, arguments: ExplorerReportInput) -> ToolExecutionResult:
-        unknown_paths = self._referenced_paths(arguments) - set(self.candidate_paths)
+        if error := self._require_inspection():
+            return error
+        missing_knowledge = self.knowledge_paths - self.knowledge_attempted
+        if missing_knowledge:
+            return _error_result(
+                "KNOWLEDGE_NOT_REVIEWED",
+                f"preview_file must be attempted for: {sorted(missing_knowledge)}",
+            )
+        unknown_paths = self._report_paths(arguments) - self.discovered_paths
         if unknown_paths:
             return _error_result(
-                "REPORT_PATH_NOT_SELECTED",
-                f"Report references paths outside candidate_paths: {sorted(unknown_paths)}",
+                "UNKNOWN_REPORT_PATH",
+                f"Report references paths absent from inspect_files: {sorted(unknown_paths)}",
             )
-        referenced_evidence = self._referenced_evidence(arguments)
-        unknown_evidence = referenced_evidence - set(self.evidence)
-        if unknown_evidence:
+        reported_paths = {item.path for item in arguments.files}
+        missing_paths = self.discovered_paths - reported_paths
+        if missing_paths:
+            return _error_result(
+                "INCOMPLETE_FILE_MAP",
+                f"Report files must include every inspected path: {sorted(missing_paths)}",
+            )
+        represented_knowledge = {item.path for item in arguments.knowledge}
+        represented_knowledge.update(
+            item.path for item in arguments.warnings if item.path in self.knowledge_paths
+        )
+        missing_knowledge_mapping = self.knowledge_paths - represented_knowledge
+        if missing_knowledge_mapping:
+            return _error_result(
+                "KNOWLEDGE_NOT_MAPPED",
+                "Each knowledge.md requires extracted knowledge or an evidence-backed warning: "
+                f"{sorted(missing_knowledge_mapping)}",
+            )
+        for item in [*arguments.knowledge, *arguments.warnings]:
+            if item.path not in self.knowledge_paths:
+                continue
+            if not any(
+                self.evidence[ref]["source_tool"] == "preview_file"
+                and self.evidence[ref].get("path") == item.path
+                for ref in item.evidence_refs
+                if ref in self.evidence
+            ):
+                return _error_result(
+                    "KNOWLEDGE_EVIDENCE_REQUIRED",
+                    f"Knowledge mapping for {item.path} must cite its preview_file evidence.",
+                )
+        evidence_refs = self._all_evidence_refs(arguments)
+        unknown_refs = evidence_refs - set(self.evidence)
+        if unknown_refs:
             return _error_result(
                 "UNKNOWN_EVIDENCE_REF",
-                f"Report references unknown evidence IDs: {sorted(unknown_evidence)}",
+                f"Report references unknown evidence IDs: {sorted(unknown_refs)}",
             )
-        unknown_fields = self._unknown_field_references(arguments)
+        known_fields = self._known_fields()
+        unknown_fields = []
+        for join in arguments.join_paths:
+            for reference in (join.left, join.right):
+                available = known_fields.get(reference.path, set())
+                if (reference.table, reference.field) not in available and not any(
+                    field == reference.field for _, field in available
+                ):
+                    unknown_fields.append(
+                        {
+                            "path": reference.path,
+                            "table": reference.table,
+                            "field": reference.field,
+                        }
+                    )
         if unknown_fields:
-            rendered_fields = [
-                {
-                    "path": reference.path,
-                    "table": reference.table,
-                    "field": reference.field,
-                }
-                for reference in unknown_fields
-            ]
             return _error_result(
                 "UNKNOWN_FIELD_REF",
-                f"Report references fields absent from evidence: {rendered_fields}",
+                f"Report references fields absent from evidence: {unknown_fields}",
             )
         report = arguments.model_dump(mode="json")
         rendered = json.dumps(report, ensure_ascii=False, separators=(",", ":"))
@@ -359,43 +579,124 @@ class _ExplorerTools:
             content={
                 "status": "reported",
                 "report": report,
-                "evidence": [
-                    self.evidence[evidence_id] for evidence_id in sorted(referenced_evidence)
-                ],
+                "evidence": [self.evidence[ref] for ref in sorted(evidence_refs)],
             },
             is_terminal=True,
         )
 
     def fallback(self, reason: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        all_refs = list(self.evidence)
-        report = {
-            "selected_sources": [
-                {
-                    "path": evidence["path"],
-                    "reason": "Selected by the main agent for focused exploration.",
-                    "evidence_refs": [evidence_id],
-                }
+        inspection_ref = next(
+            (
+                evidence_id
                 for evidence_id, evidence in self.evidence.items()
-                if evidence["source_tool"] == "context_inventory"
-            ],
-            "evidence_refs": all_refs,
-            "key_fields": [],
-            "join_candidates": [],
-            "recommended_checks": [],
+                if evidence["source_tool"] == "inspect_files"
+            ),
+            None,
+        )
+        files: list[dict[str, Any]] = []
+        schema_map: dict[str, dict[str, Any]] = {}
+        if inspection_ref is not None:
+            inspection = self.evidence[inspection_ref]["observation"]
+            for item in inspection.get("files", []):
+                if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+                    continue
+                path = item["path"]
+                summary = item.get("summary", {})
+                row_count = summary.get("row_count") if isinstance(summary, dict) else None
+                files.append(
+                    {
+                        "path": path,
+                        "format": str(item.get("kind", "unknown")),
+                        "row_count": row_count if isinstance(row_count, int) else None,
+                        "evidence_refs": [inspection_ref],
+                    }
+                )
+                columns = summary.get("columns", []) if isinstance(summary, dict) else []
+                schema_map[path] = {
+                    "path": path,
+                    "table": None,
+                    "columns": [str(column) for column in columns[:64]],
+                    "semantics": {},
+                    "evidence_refs": [inspection_ref],
+                }
+        evidence_refs = list(self.evidence)
+        warning_refs = evidence_refs[:1]
+        report = {
+            "files": files,
+            "schema_map": schema_map,
+            "knowledge": [],
             "etl_candidates": [],
-            "warnings": [reason],
-            "uncertainties": ["The Explorer did not submit a validated evidence-first report."],
+            "join_paths": [],
+            "value_samples": {},
+            "warnings": (
+                [{"message": reason, "evidence_refs": warning_refs}] if warning_refs else []
+            ),
         }
-        return report, [self.evidence[evidence_id] for evidence_id in all_refs]
+        truncated = False
+        while (
+            len(json.dumps(report, ensure_ascii=False, separators=(",", ":"), default=str))
+            > self.config.max_report_chars
+            and report["schema_map"]
+        ):
+            report["schema_map"].pop(next(reversed(report["schema_map"])))
+            truncated = True
+        while (
+            len(json.dumps(report, ensure_ascii=False, separators=(",", ":"), default=str))
+            > self.config.max_report_chars
+            and report["files"]
+        ):
+            report["files"].pop()
+            truncated = True
+        if truncated and warning_refs:
+            report["warnings"].append(
+                {
+                    "message": "Fallback data map was truncated to the report character budget.",
+                    "evidence_refs": warning_refs,
+                }
+            )
+            while (
+                len(json.dumps(report, ensure_ascii=False, separators=(",", ":"), default=str))
+                > self.config.max_report_chars
+                and report["files"]
+            ):
+                report["files"].pop()
+        return report, list(self.evidence.values())
 
     def registry(self) -> ToolRegistry:
         return ToolRegistry(
             specs={
+                "execute_context_sql": ToolSpec(
+                    name="execute_context_sql",
+                    description=(
+                        "Run bounded read-only SELECT, WITH, PRAGMA, or EXPLAIN SQL against an "
+                        "inspected SQLite file. Never compute the final answer."
+                    ),
+                    input_model=ExplorerSqlInput,
+                    handler=self.sql,
+                ),
+                "grep_context": ToolSpec(
+                    name="grep_context",
+                    description=(
+                        "Search a bounded case-insensitive regex across inspected Phase 1 text "
+                        "and SQLite sources. Use only to locate evidence, not aggregate data."
+                    ),
+                    input_model=GrepContextInput,
+                    handler=self.grep,
+                ),
+                "inspect_files": ToolSpec(
+                    name="inspect_files",
+                    description=(
+                        "Use first and alone to build a bounded map of every Phase 1 context "
+                        "file, schema, warning, and candidate relationship."
+                    ),
+                    input_model=InspectFilesInput,
+                    handler=self.inspect,
+                ),
                 "preview_file": ToolSpec(
                     name="preview_file",
                     description=(
-                        "Preview one file from explore.candidate_paths and receive an immutable "
-                        "evidence_id. At most two previews are allowed."
+                        "Preview one path returned by inspect_files and receive immutable "
+                        "evidence. Every knowledge.md must be previewed before report."
                     ),
                     input_model=PreviewFileInput,
                     handler=self.preview,
@@ -403,10 +704,8 @@ class _ExplorerTools:
                 "report": ToolSpec(
                     name="report",
                     description=(
-                        "Submit the evidence-first Explorer report and finish. Every claim must "
-                        "reference an evidence_id already supplied by inventory or preview_file. "
-                        "Use recommended_checks for bounded validations the main agent should "
-                        "perform; never include executable code or SQL."
+                        "Submit the evidence-backed data map and finish. Must be the only call "
+                        "in its turn; joins and ETL entries remain advisory candidates."
                     ),
                     input_model=ExplorerReportInput,
                     handler=self.report,
@@ -422,12 +721,10 @@ class ExplorerRunner:
         *,
         model: ModelAdapter,
         config: ExplorerConfig,
-        inventory: dict[str, Any],
         event_sink: EventSink | None = None,
     ) -> None:
         self.model = model
         self.config = config
-        self.inventory = inventory
         self.event_sink = event_sink
 
     def _fallback_result(
@@ -436,15 +733,21 @@ class ExplorerRunner:
         tools: _ExplorerTools,
         steps_used: int,
         reason: str,
+        reason_code: str,
     ) -> ExplorerResult:
         report, evidence = tools.fallback(reason)
         emit_event(
             self.event_sink,
             "explorer_fallback_used",
-            {"steps_used": steps_used, "reason_code": "REPORT_UNAVAILABLE"},
+            {"steps_used": steps_used, "reason_code": reason_code},
+        )
+        emit_event(
+            self.event_sink,
+            "explorer_completed",
+            {"steps_used": steps_used, "fallback_used": True, "success": bool(evidence)},
         )
         return ExplorerResult(
-            success=True,
+            success=bool(evidence),
             report=report,
             evidence=evidence,
             steps_used=steps_used,
@@ -452,38 +755,43 @@ class ExplorerRunner:
             failure_reason=reason,
         )
 
-    def run(self, task: PublicTask, request: ExploreInput) -> ExplorerResult:
-        tools = _ExplorerTools(
-            config=self.config,
-            inventory=self.inventory,
-            candidate_paths=request.candidate_paths,
-        )
+    @staticmethod
+    def _protocol_observation(code: str, message: str) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "content": {"error": {"code": code, "message": message, "recoverable": True}},
+        }
+
+    def run(self, task: PublicTask, _: ExploreInput) -> ExplorerResult:
+        tools = _ExplorerTools(config=self.config, event_sink=self.event_sink)
         registry = tools.registry()
         messages = [
             ModelMessage(role="system", content=EXPLORER_SYSTEM_PROMPT),
             ModelMessage(
                 role="user",
-                content=json.dumps(
-                    {
-                        "question": task.question,
-                        "focus": request.focus,
-                        "candidate_evidence": tools.initial_evidence(),
-                    },
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                    default=str,
+                content=(
+                    f"Question: {task.question}\n"
+                    "Begin with inspect_files({}). All paths are relative to context/."
                 ),
             ),
         ]
+        started_at = monotonic()
         emit_event(
             self.event_sink,
             "explorer_started",
             {
                 "max_steps": self.config.max_steps,
-                "candidate_path_count": len(request.candidate_paths),
+                "max_duration_seconds": self.config.max_duration_seconds,
             },
         )
         for step_index in range(1, self.config.max_steps + 1):
+            if monotonic() - started_at >= self.config.max_duration_seconds:
+                return self._fallback_result(
+                    tools=tools,
+                    steps_used=step_index - 1,
+                    reason="Explorer exceeded its soft time budget.",
+                    reason_code="SOFT_TIMEOUT",
+                )
             try:
                 response = self.model.complete(
                     messages,
@@ -499,68 +807,111 @@ class ExplorerRunner:
                     tools=tools,
                     steps_used=step_index,
                     reason=f"Explorer model request failed: {type(exc).__name__}.",
+                    reason_code="MODEL_FAILURE",
                 )
 
-            if len(response.tool_calls) != 1:
-                message = "Explorer must call exactly one native tool per turn."
-                if response.tool_calls and all(
-                    call.id and call.name for call in response.tool_calls
-                ):
+            calls = response.tool_calls
+            replayable = bool(calls) and all(call.id and call.name for call in calls)
+            protocol_error: tuple[str, str] | None = None
+            if not calls:
+                protocol_error = ("NO_TOOL_CALL", "Explorer must call one or two native tools.")
+            elif len(calls) > 2:
+                protocol_error = (
+                    "TOO_MANY_TOOL_CALLS",
+                    "Explorer may call at most two tools in one model turn.",
+                )
+            elif not replayable:
+                protocol_error = ("INVALID_TOOL_CALL", "Explorer tool calls require id and name.")
+            elif not tools.inspect_completed and (
+                len(calls) != 1 or calls[0].name != "inspect_files"
+            ):
+                protocol_error = (
+                    "INSPECT_REQUIRED",
+                    "The first successful Explorer turn must call inspect_files alone.",
+                )
+            elif any(call.name == "report" for call in calls) and (
+                len(calls) != 1 or calls[0].name != "report"
+            ):
+                protocol_error = (
+                    "REPORT_MUST_BE_EXCLUSIVE",
+                    "report must be the only tool call in its turn.",
+                )
+
+            if protocol_error is not None:
+                code, message = protocol_error
+                if replayable:
                     messages.append(_assistant_message(response))
-                    for call in response.tool_calls:
-                        messages.append(_tool_message(call, {"ok": False, "error": message}))
+                    for call in calls:
+                        messages.append(
+                            _tool_message(call, self._protocol_observation(code, message))
+                        )
                 else:
-                    messages.append(ModelMessage(role="user", content=message))
-                emit_event(
-                    self.event_sink,
-                    "explorer_step_completed",
-                    {"explorer_step_index": step_index, "ok": False, "error": "PROTOCOL_ERROR"},
-                )
-                continue
-
-            call = response.tool_calls[0]
-            if not call.id or not call.name:
-                messages.append(
-                    ModelMessage(role="user", content="Explorer tool calls require id and name.")
-                )
-                emit_event(
-                    self.event_sink,
-                    "explorer_step_completed",
-                    {"explorer_step_index": step_index, "ok": False, "error": "INVALID_TOOL_CALL"},
-                )
-                continue
-            if step_index == self.config.max_steps and call.name != "report":
+                    messages.append(
+                        ModelMessage(
+                            role="user",
+                            content=f"Explorer protocol error ({code}): {message}",
+                        )
+                    )
                 emit_event(
                     self.event_sink,
                     "explorer_step_completed",
                     {
                         "explorer_step_index": step_index,
-                        "tool": call.name,
                         "ok": False,
-                        "error": "FINAL_STEP_REPORT_REQUIRED",
+                        "error_code": code,
+                        "tool_call_count": len(calls),
                     },
                 )
+                continue
+
+            if step_index == self.config.max_steps and calls[0].name != "report":
                 return self._fallback_result(
                     tools=tools,
                     steps_used=step_index,
-                    reason="Explorer final step did not submit report.",
+                    reason="Explorer final turn did not submit report.",
+                    reason_code="FINAL_REPORT_MISSING",
                 )
 
             messages.append(_assistant_message(response))
-            result = registry.execute(task, call)
-            observation = {"ok": result.ok, "tool": call.name, "content": result.content}
-            messages.append(_tool_message(call, observation))
-            emit_event(
-                self.event_sink,
-                "explorer_step_completed",
-                {
-                    "explorer_step_index": step_index,
-                    "tool": call.name,
-                    "ok": result.ok,
-                    "error_code": result.error_code,
-                },
-            )
-            if result.is_terminal and result.ok:
+            terminal_result: ToolExecutionResult | None = None
+            for call_index, call in enumerate(calls):
+                if monotonic() - started_at >= self.config.max_duration_seconds:
+                    return self._fallback_result(
+                        tools=tools,
+                        steps_used=step_index,
+                        reason="Explorer exceeded its soft time budget.",
+                        reason_code="SOFT_TIMEOUT",
+                    )
+                result = registry.execute(task, call)
+                messages.append(
+                    _tool_message(
+                        call,
+                        {"ok": result.ok, "tool": call.name, "content": result.content},
+                    )
+                )
+                emit_event(
+                    self.event_sink,
+                    "explorer_step_completed",
+                    {
+                        "explorer_step_index": step_index,
+                        "tool_call_index": call_index,
+                        "tool_call_id": call.id,
+                        "tool": call.name,
+                        "ok": result.ok,
+                        "error_code": result.error_code,
+                    },
+                )
+                if call.name == "inspect_files" and result.error_code == "INSPECT_FAILED":
+                    return self._fallback_result(
+                        tools=tools,
+                        steps_used=step_index,
+                        reason="Explorer could not inspect the task context.",
+                        reason_code="INSPECT_FAILED",
+                    )
+                if result.is_terminal and result.ok:
+                    terminal_result = result
+
+            if terminal_result is not None:
                 emit_event(
                     self.event_sink,
                     "explorer_completed",
@@ -568,8 +919,8 @@ class ExplorerRunner:
                 )
                 return ExplorerResult(
                     success=True,
-                    report=result.content["report"],
-                    evidence=result.content["evidence"],
+                    report=terminal_result.content["report"],
+                    evidence=terminal_result.content["evidence"],
                     steps_used=step_index,
                 )
 
@@ -577,6 +928,7 @@ class ExplorerRunner:
             tools=tools,
             steps_used=self.config.max_steps,
             reason="Explorer exhausted its step budget without a valid report.",
+            reason_code="STEP_BUDGET_EXHAUSTED",
         )
 
 
@@ -584,45 +936,35 @@ class ExplorerRunner:
 class ExplorerToolHandler:
     model: ModelAdapter
     config: ExplorerConfig
-    inventory: dict[str, Any]
     event_sink: EventSink | None = None
-    _results: dict[tuple[str, str, tuple[str, ...]], ExplorerResult] = field(default_factory=dict)
+    _results: dict[str, ExplorerResult] = field(default_factory=dict)
 
     def __call__(self, task: PublicTask, request: ExploreInput) -> ToolExecutionResult:
-        exploration = self.inventory.get("exploration")
-        if isinstance(exploration, dict) and exploration.get("recommended") is True:
-            expected_focus = exploration.get("focus")
-            expected_paths = exploration.get("candidate_paths")
-            if request.focus != expected_focus or request.candidate_paths != expected_paths:
-                return _error_result(
-                    "EXPLORATION_REQUEST_MISMATCH",
-                    "Use exploration.focus and exploration.candidate_paths exactly as supplied.",
-                )
-        available_paths = set(_inventory_entries(self.inventory))
-        unknown_paths = set(request.candidate_paths) - available_paths
-        if unknown_paths:
-            return _error_result(
-                "INVALID_CANDIDATE_PATH",
-                f"candidate_paths are not present in Context Inventory: {sorted(unknown_paths)}",
-            )
-        cache_key = (task.task_id, request.focus, tuple(request.candidate_paths))
-        cached = cache_key in self._results
-        result = self._results.get(cache_key)
+        cached = task.task_id in self._results
+        result = self._results.get(task.task_id)
         if result is None:
             result = ExplorerRunner(
                 model=self.model,
                 config=self.config,
-                inventory=self.inventory,
                 event_sink=self.event_sink,
             ).run(task, request)
-            self._results[cache_key] = result
+            self._results[task.task_id] = result
         return ToolExecutionResult(
             ok=True,
             content={
-                "explorer_status": "fallback" if result.fallback_used else "ok",
-                "focus": request.focus,
+                "explorer_status": (
+                    "fallback" if result.fallback_used else ("ok" if result.success else "failed")
+                ),
                 "report": result.report,
-                "evidence": result.evidence,
+                "evidence_index": [
+                    {
+                        "evidence_id": evidence["evidence_id"],
+                        "source_tool": evidence["source_tool"],
+                        "path": evidence.get("path"),
+                    }
+                    for evidence in result.evidence
+                ],
+                "evidence_count": len(result.evidence),
                 "steps_used": result.steps_used,
                 "fallback_used": result.fallback_used,
                 "cached": cached,
@@ -634,23 +976,19 @@ def create_explorer_tool_spec(
     *,
     model: ModelAdapter,
     config: ExplorerConfig,
-    inventory: dict[str, Any],
     event_sink: EventSink | None = None,
 ) -> ToolSpec:
     return ToolSpec(
         name="explore",
         description=(
-            "Use only when the injected Context Inventory leaves a specific ambiguity about "
-            "source selection, field semantics, joins, or document mapping. Provide a concise "
-            "focus and 1-8 candidate paths copied exactly from the Inventory. A bounded "
-            "evidence-first sub-agent may preview at most two selected files and returns "
-            "evidence plus candidates that the main agent must verify before computation."
+            "Use first as explore({}). It launches a Phase 1 discovery-only sub-agent that "
+            "inspects all context files, explicitly reads knowledge.md, performs bounded "
+            "preview/grep/read-only SQL discovery, and returns an evidence-backed data map."
         ),
         input_model=ExploreInput,
         handler=ExplorerToolHandler(
             model=model,
             config=config,
-            inventory=inventory,
             event_sink=event_sink,
         ),
     )

@@ -102,12 +102,12 @@ run:
 
 explorer:
   enabled: true
-  max_steps: 3
+  max_steps: 10
+  max_duration_seconds: 60
   max_files: 64
   max_preview_calls: 2
   max_preview_chars: 2000
   max_inventory_chars: 12000
-  max_prompt_inventory_chars: 6000
   max_report_chars: 4000
 ```
 
@@ -128,9 +128,9 @@ explorer:
 | `run.run_id` | 可选，指定运行目录名。不传时默认使用 UTC 时间戳；使用 `--resume` 时必须填写。 |
 | `run.max_workers` | `run-benchmark` 并行 worker 数。 |
 | `run.task_timeout_seconds` | 单个任务允许的最长墙钟时间。设为 `0` 或负数可关闭任务级超时。 |
-| `explorer.enabled` | 是否注入 Inventory v2；确定性歧义信号建议探索时，首次模型请求只暴露一次定向 `explore`，之后恢复常规工具。 |
-| `explorer.max_steps` | 单次定向 Explorer 最多可使用的原生工具调用步数。 |
-| `explorer.max_prompt_inventory_chars` | 首次模型请求前注入的序列化 Inventory 最大字符数。 |
+| `explorer.enabled` | 是否在主 Agent 首轮仅暴露一次无参数 `explore({})`；文件地图由子 Agent 生成，不在调用前自动注入 Inventory。 |
+| `explorer.max_steps` | Explorer 子 Agent 的模型轮次硬上限；除首轮 inspect 和末轮 report 外，每轮最多执行两个独立发现工具。 |
+| `explorer.max_duration_seconds` | Explorer 软墙钟上限；超限时先用已有证据生成有界 fallback，避免直接耗尽任务级硬超时。 |
 
 ## CLI
 
@@ -184,10 +184,12 @@ uv run dabench run-benchmark \
 
 ## Tools
 
-工具通过 OpenAI-compatible 原生 `tools` 字段提供给模型。模型每轮返回一个
+工具通过 OpenAI-compatible 原生 `tools` 字段提供给模型。主 Agent 每轮返回一个
 `tool_call`，注册表在执行前使用 Pydantic 校验 JSON 参数，结果再通过带有匹配
 `tool_call_id` 的 `tool` 消息返回。现有 `agent.api_base` 配置也可直接连接阿里云百炼
 OpenAI-compatible Chat Completions 接口。
+Explorer 是唯一的局部例外：其首轮必须单独调用 `inspect_files({})`，之后每轮最多返回
+两个彼此独立的发现调用，每个调用仍按原始 call ID 分别接收 observation。
 `answer` 调用还必须通过确定性的 CSV 安全校验才能终止任务；被拒绝的候选答案会收到可恢复
 的工具观察，以便模型修正后重提。
 
@@ -196,7 +198,7 @@ OpenAI-compatible Chat Completions 接口。
 | 工具 | 作用 | 输入 |
 | --- | --- | --- |
 | `list_context` | 列出 `context/` 下的文件和目录。 | `max_depth` |
-| `explore` | 对 Inventory v2 标记的歧义运行一次受限 evidence-first 子 Agent；只在要求探索的首次请求中暴露，随后移除。 | `focus`、`candidate_paths` |
+| `explore` | 启动一次受限的 Phase 1 发现子 Agent；它先扫描文件、显式预览每个 `knowledge.md`，再按需使用有界 preview、grep 和只读 SQL，最终返回带证据引用的数据地图。成功或 fail-open 后都会移除。 | 无（`{}`） |
 | `read_csv` | 读取 CSV 预览。 | `path`、`max_rows` |
 | `read_json` | 读取 JSON 预览。 | `path`、`max_chars` |
 | `read_doc` | 读取文本文档预览。 | `path`、`max_chars` |
@@ -206,6 +208,9 @@ OpenAI-compatible Chat Completions 接口。
 | `answer` | 提交最终答案表格并结束当前任务。 | `columns`、`rows` |
 
 所有文件路径都必须是相对于任务 `context/` 目录的相对路径。
+`explore` 内部的子 Agent 注册表只包含 `inspect_files`、`preview_file`、
+`grep_context`、有界只读 `execute_context_sql` 和终止工具 `report`；这些发现工具不会与
+主 Agent 的常规计算工具同时暴露。
 
 ## 输出
 

@@ -19,12 +19,12 @@ run:
 
 explorer:
   enabled: true
-  max_steps: 3
+  max_steps: 10
+  max_duration_seconds: 60
   max_files: 64
   max_preview_calls: 2
   max_preview_chars: 2000
   max_inventory_chars: 12000
-  max_prompt_inventory_chars: 6000
   max_report_chars: 4000
   max_total_read_bytes: 4194304
   max_single_file_bytes: 262144

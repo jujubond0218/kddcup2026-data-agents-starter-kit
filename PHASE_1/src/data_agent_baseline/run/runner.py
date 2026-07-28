@@ -16,8 +16,7 @@ from data_agent_baseline.agents.model import OpenAIModelAdapter
 from data_agent_baseline.agents.react import ReActAgent, ReActAgentConfig
 from data_agent_baseline.benchmark.dataset import DABenchPublicDataset
 from data_agent_baseline.config import AppConfig
-from data_agent_baseline.events import EventSink, JsonlEventRecorder, emit_event, read_events
-from data_agent_baseline.exploration.inventory import compact_inventory, inspect_context
+from data_agent_baseline.events import EventSink, JsonlEventRecorder, read_events
 from data_agent_baseline.exploration.runner import ExplorerConfig, create_explorer_tool_spec
 from data_agent_baseline.tools.registry import ToolRegistry, create_default_tool_registry
 
@@ -131,86 +130,14 @@ def _run_single_task_core(
     public_dataset = DABenchPublicDataset(config.dataset.root_path)
     task = public_dataset.get_task(task_id)
 
-    full_inventory: dict[str, Any] | None = None
-    prompt_inventory: dict[str, Any] | None = None
-    if config.explorer.enabled:
-        explorer_config = ExplorerConfig(**asdict(config.explorer))
-        try:
-            full_inventory = inspect_context(task, explorer_config.inventory_limits())
-            prompt_inventory = compact_inventory(
-                full_inventory,
-                config.explorer.max_prompt_inventory_chars,
-            )
-            rendered_inventory = json.dumps(
-                prompt_inventory,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                default=str,
-            )
-            exploration = full_inventory.get("exploration", {})
-            emit_event(
-                event_sink,
-                "context_inventory_created",
-                {
-                    "status": full_inventory.get("status"),
-                    "file_count": full_inventory.get("budget", {}).get(
-                        "files_scanned",
-                        len(full_inventory.get("files", [])),
-                    ),
-                    "prompt_file_count": len(prompt_inventory.get("files", [])),
-                    "warning_count": len(full_inventory.get("warnings", [])),
-                    "truncated": bool(full_inventory.get("truncated")),
-                    "prompt_chars": len(rendered_inventory),
-                    "read_bytes": full_inventory.get("budget", {}).get("read_bytes", 0),
-                    "exploration_recommended": bool(exploration.get("recommended")),
-                    "ambiguity_count": len(exploration.get("ambiguity_codes", [])),
-                    "relation_candidate_count": len(full_inventory.get("relation_candidates", [])),
-                },
-            )
-        except Exception as exc:  # noqa: BLE001
-            prompt_inventory = {
-                "schema_version": 2,
-                "status": "failed",
-                "files": [],
-                "exploration": {
-                    "recommended": False,
-                    "focus": "",
-                    "candidate_paths": [],
-                    "ambiguity_codes": [],
-                },
-                "relation_candidates": [],
-                "warnings": [
-                    {
-                        "code": "CONTEXT_INVENTORY_FAILED",
-                        "message": (
-                            "Context Inventory failed; use the normal context tools instead."
-                        ),
-                    }
-                ],
-                "truncated": True,
-            }
-            emit_event(
-                event_sink,
-                "context_inventory_failed",
-                {"error_type": type(exc).__name__},
-            )
-
     effective_model = model or build_model_adapter(config, event_sink=event_sink)
     effective_tools = tools or create_default_tool_registry()
-    if (
-        tools is None
-        and config.explorer.enabled
-        and full_inventory is not None
-        and full_inventory.get("files")
-        and full_inventory.get("exploration", {}).get("recommended") is True
-        and prompt_inventory is not None
-        and prompt_inventory.get("exploration", {}).get("recommended") is True
-    ):
+    if tools is None and config.explorer.enabled:
+        explorer_config = ExplorerConfig(**asdict(config.explorer))
         specs = dict(effective_tools.specs)
         specs["explore"] = create_explorer_tool_spec(
             model=effective_model,
             config=explorer_config,
-            inventory=full_inventory,
             event_sink=event_sink,
         )
         effective_tools = ToolRegistry(specs=specs)
@@ -220,7 +147,6 @@ def _run_single_task_core(
         tools=effective_tools,
         config=ReActAgentConfig(max_steps=config.agent.max_steps),
         event_sink=event_sink,
-        context_inventory=prompt_inventory,
     )
     run_result = agent.run(task)
     return run_result.to_dict()

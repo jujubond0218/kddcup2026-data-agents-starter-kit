@@ -1,6 +1,8 @@
 import json
 import sqlite3
 
+from pypdf import PdfWriter
+
 from data_agent_baseline.benchmark.schema import PublicTask, TaskAssets, TaskRecord
 from data_agent_baseline.exploration.inventory import (
     InventoryLimits,
@@ -113,7 +115,7 @@ def test_compact_inventory_is_detached_and_respects_prompt_budget(tmp_path):
     assert inventory["files"][0].get("summary") is not None
 
 
-def test_inventory_builds_bounded_relation_candidates_and_exploration_request(tmp_path):
+def test_inspection_builds_bounded_relation_candidates_without_trigger_state(tmp_path):
     task = _task(tmp_path)
     (task.context_dir / "orders.csv").write_text(
         "customer_id,region,amount\nC1,north,10\nC2,south,20\n",
@@ -139,9 +141,8 @@ def test_inventory_builds_bounded_relation_candidates_and_exploration_request(tm
 
     report = inspect_context(task, _limits(max_inventory_chars=12_000))
 
-    assert report["schema_version"] == 2
-    assert report["exploration"]["recommended"] is True
-    assert len(report["exploration"]["candidate_paths"]) <= 8
+    assert report["schema_version"] == 3
+    assert "exploration" not in report
     assert len(report["relation_candidates"]) <= 12
     assert all(item["status"] == "candidate" for item in report["relation_candidates"])
     assert any(
@@ -150,7 +151,7 @@ def test_inventory_builds_bounded_relation_candidates_and_exploration_request(tm
     assert "_field_profiles" not in json.dumps(report)
 
 
-def test_relation_candidates_alone_do_not_force_exploration(tmp_path):
+def test_relation_candidates_remain_advisory_inspection_output(tmp_path):
     task = _task(tmp_path)
     (task.context_dir / "left.csv").write_text("id,value\n1,a\n2,b\n", encoding="utf-8")
     (task.context_dir / "right.csv").write_text("id,value\n1,a\n2,b\n", encoding="utf-8")
@@ -158,8 +159,7 @@ def test_relation_candidates_alone_do_not_force_exploration(tmp_path):
     report = inspect_context(task, _limits())
 
     assert report["relation_candidates"]
-    assert report["exploration"]["recommended"] is False
-    assert report["exploration"]["candidate_paths"] == []
+    assert "exploration" not in report
 
 
 def test_targeted_preview_is_deeper_than_inventory_and_output_is_bounded(tmp_path):
@@ -177,6 +177,41 @@ def test_targeted_preview_is_deeper_than_inventory_and_output_is_bounded(tmp_pat
     assert len(inventory["files"][0]["summary"]["sample_rows"]) == 2
     assert preview["summary"]["sample_row_count"] == 10
     assert len(json.dumps(preview["summary"], ensure_ascii=False, separators=(",", ":"))) <= 500
+
+
+def test_targeted_preview_supports_phase1_structured_and_document_inputs(tmp_path):
+    task = _task(tmp_path)
+    (task.context_dir / "data.tsv").write_text("id\tvalue\n1\talpha\n", encoding="utf-8")
+    (task.context_dir / "data.json").write_text(
+        json.dumps({"records": [{"id": 1, "value": "alpha"}]}),
+        encoding="utf-8",
+    )
+    (task.context_dir / "notes.md").write_text("# Rules\nUse value.", encoding="utf-8")
+    database_path = task.context_dir / "facts.sqlite"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE facts (id INTEGER, value TEXT)")
+        connection.execute("INSERT INTO facts VALUES (1, 'alpha')")
+    pdf_path = task.context_dir / "notes.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    with pdf_path.open("wb") as stream:
+        writer.write(stream)
+    limits = _limits(
+        max_single_file_bytes=10_000,
+        max_pdf_bytes=10_000,
+    )
+
+    previews = {
+        name: preview_context_file(task, name, limits, max_chars=1_000)
+        for name in ("data.tsv", "data.json", "facts.sqlite", "notes.md", "notes.pdf")
+    }
+
+    assert previews["data.tsv"]["kind"] == "tabular"
+    assert previews["data.json"]["summary"]["top_level"] == "object"
+    assert previews["facts.sqlite"]["summary"]["tables"][0]["name"] == "facts"
+    assert previews["notes.md"]["summary"]["headings"] == ["Rules"]
+    assert previews["notes.pdf"]["kind"] == "pdf"
+    assert previews["notes.pdf"]["summary"]["page_count"] == 1
 
 
 def test_targeted_preview_rejects_path_escape(tmp_path):
