@@ -70,40 +70,27 @@ def _report(
     knowledge_ref: str | None = None,
     knowledge_path: str = "knowledge.md",
 ) -> dict:
-    schema_ref = sales_ref or inspect_ref
+    del inspect_ref
     report = {
-        "files": [
-            {
-                "path": "sales.csv",
-                "format": "tabular",
-                "row_count": 3,
-                "evidence_refs": [inspect_ref],
-            }
-        ],
-        "schema_map": {
-            "sales.csv": {
-                "path": "sales.csv",
-                "table": None,
-                "columns": ["customer_id", "amount"],
-                "semantics": {},
-                "evidence_refs": [schema_ref],
-            }
-        },
+        "selected_sources": ["sales.csv"],
+        "field_semantics": [],
         "knowledge": [],
         "etl_candidates": [],
         "join_paths": [],
-        "value_samples": {},
         "warnings": [],
+        "uncertainties": [],
     }
-    if knowledge_ref is not None:
-        report["files"].append(
+    if sales_ref is not None:
+        report["field_semantics"].append(
             {
-                "path": knowledge_path,
-                "format": "markdown",
-                "row_count": None,
-                "evidence_refs": [inspect_ref],
+                "path": "sales.csv",
+                "table": None,
+                "field": "amount",
+                "meaning": "Sales amount.",
+                "evidence_refs": [sales_ref],
             }
         )
+    if knowledge_ref is not None:
         report["knowledge"].append(
             {
                 "path": knowledge_path,
@@ -156,6 +143,12 @@ def test_explorer_inspects_then_reads_knowledge_and_supports_two_calls_per_turn(
     assert result.success is True
     assert result.fallback_used is False
     assert result.steps_used == 3
+    assert {item["path"] for item in result.report["files"]} == {
+        "knowledge.md",
+        "sales.csv",
+    }
+    assert result.report["schema_map"]["sales.csv"]["columns"] == ["customer_id", "amount"]
+    assert {item["source_tool"] for item in result.report["evidence_summaries"]} == {"preview_file"}
     assert {item["evidence_id"] for item in result.evidence} == {
         "inspect:1",
         "preview:1",
@@ -164,8 +157,15 @@ def test_explorer_inspects_then_reads_knowledge_and_supports_two_calls_per_turn(
     assert model.requested_tool_names[0] == ("inspect_files",)
     assert "execute_context_sql" not in model.requested_tool_names[1]
     assert "inspect_files" not in model.requested_tool_names[1]
-    assert model.requests[2][-2].tool_call_id == "knowledge_preview"
-    assert model.requests[2][-1].tool_call_id == "sales_preview"
+    preview_observations = [
+        message
+        for message in model.requests[2]
+        if message.role == "tool" and message.tool_call_id in {"knowledge_preview", "sales_preview"}
+    ]
+    assert [message.tool_call_id for message in preview_observations] == [
+        "knowledge_preview",
+        "sales_preview",
+    ]
     assert any(kind == "explorer_knowledge_reviewed" for kind, _ in events)
     assert any(kind == "explorer_completed" for kind, _ in events)
 
@@ -218,7 +218,12 @@ def test_explorer_rejects_more_than_two_calls_and_mixed_report(tmp_path):
     assert result.steps_used == 4
     first_error = json.loads(model.requests[1][-1].content)
     assert first_error["content"]["error"]["code"] == "TOO_MANY_TOOL_CALLS"
-    mixed_error = json.loads(model.requests[3][-1].content)
+    mixed_error_message = next(
+        message
+        for message in model.requests[3]
+        if message.role == "tool" and message.tool_call_id == "mixed_report"
+    )
+    mixed_error = json.loads(mixed_error_message.content)
     assert mixed_error["content"]["error"]["code"] == "REPORT_MUST_BE_EXCLUSIVE"
 
 
@@ -281,14 +286,6 @@ def test_knowledge_preview_failure_can_be_reported_as_evidence_warning(tmp_path,
     )
     failed = tools.preview(task, PreviewFileInput(path="knowledge.md"))
     report = _report(inspect_ref=inspected.content["evidence_id"])
-    report["files"].append(
-        {
-            "path": "knowledge.md",
-            "format": "markdown",
-            "row_count": None,
-            "evidence_refs": [inspected.content["evidence_id"]],
-        }
-    )
     report["warnings"].append(
         {
             "path": "knowledge.md",
@@ -449,17 +446,26 @@ def test_explorer_sql_output_is_character_bounded(tmp_path):
     assert observation["truncated"] is True
 
 
-def test_report_rejects_unknown_path_evidence_and_join_field(tmp_path):
+def test_report_ignores_unsupported_semantic_increments_without_losing_runtime_map(tmp_path):
     task = _task(tmp_path)
     tools = _ExplorerTools(config=ExplorerConfig())
     inspected = tools.inspect(task, InspectFilesInput())
     inspect_ref = inspected.content["evidence_id"]
 
     unknown_path = _report(inspect_ref=inspect_ref)
-    unknown_path["files"][0]["path"] = "missing.csv"
+    unknown_path["selected_sources"] = ["missing.csv"]
     path_result = tools.report(task, ExplorerReportInput.model_validate(unknown_path))
 
-    unknown_evidence = _report(inspect_ref="inspect:99")
+    unknown_evidence = _report()
+    unknown_evidence["field_semantics"] = [
+        {
+            "path": "sales.csv",
+            "field": "amount",
+            "table": None,
+            "meaning": "Sales amount.",
+            "evidence_refs": ["inspect:99"],
+        }
+    ]
     evidence_result = tools.report(task, ExplorerReportInput.model_validate(unknown_evidence))
 
     unknown_field = _report(inspect_ref=inspect_ref)
@@ -473,12 +479,40 @@ def test_report_rejects_unknown_path_evidence_and_join_field(tmp_path):
     ]
     field_result = tools.report(task, ExplorerReportInput.model_validate(unknown_field))
 
-    assert path_result.error_code == "UNKNOWN_REPORT_PATH"
-    assert evidence_result.error_code == "UNKNOWN_EVIDENCE_REF"
-    assert field_result.error_code == "UNKNOWN_FIELD_REF"
+    for result in (path_result, evidence_result, field_result):
+        assert result.ok is True
+        assert result.content["report"]["files"][0]["path"] == "sales.csv"
+        assert any(
+            warning["message"].startswith("Ignored unsupported")
+            or warning["message"].startswith("Ignored unknown")
+            for warning in result.content["report"]["warnings"]
+        )
 
 
-def test_final_turn_without_report_and_model_failure_use_inspection_fallback(tmp_path):
+def test_final_turn_free_retry_accepts_semantic_report(tmp_path):
+    task = _task(tmp_path)
+    events = []
+    result = ExplorerRunner(
+        model=ScriptedModelAdapter(
+            [
+                _single_response("inspect_files", {}, "inspect"),
+                _single_response("preview_file", {"path": "sales.csv"}, "late"),
+                _single_response("report", _report(), "retry_report"),
+            ]
+        ),
+        config=ExplorerConfig(max_steps=2),
+        event_sink=lambda kind, payload: events.append((kind, payload)),
+    ).run(task, ExploreInput())
+
+    assert result.success is True
+    assert result.fallback_used is False
+    assert result.steps_used == 2
+    retry = next(payload for kind, payload in events if kind == "explorer_final_report_retry")
+    assert retry["retry_index"] == 1
+    assert retry["error_code"] == "FINAL_REPORT_REQUIRED"
+
+
+def test_final_retries_and_model_failure_use_deterministic_fallback(tmp_path):
     task = _task(tmp_path)
     final_missing = ExplorerRunner(
         model=ScriptedModelAdapter(
@@ -512,11 +546,88 @@ def test_fallback_report_respects_character_budget(tmp_path):
 
     result = ExplorerRunner(
         model=model,
-        config=ExplorerConfig(max_report_chars=1_000),
+        config=ExplorerConfig(max_inventory_chars=1_000),
     ).run(task, ExploreInput())
 
     assert result.fallback_used is True
     assert len(json.dumps(result.report, ensure_ascii=False, separators=(",", ":"))) <= 1_000
+
+
+def test_fallback_absorbs_successful_preview_grep_and_sql_observations(tmp_path):
+    task = _task(tmp_path)
+    database_path = task.context_dir / "facts.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE facts (id INTEGER, label TEXT)")
+        connection.executemany("INSERT INTO facts VALUES (?, ?)", [(1, "Alpha"), (2, "Beta")])
+    model = ScriptedModelAdapter(
+        [
+            _single_response("inspect_files", {}, "inspect"),
+            _response(
+                _call("preview_file", {"path": "sales.csv"}, "preview"),
+                _call("grep_context", {"pattern": "C1"}, "grep"),
+            ),
+            _single_response(
+                "execute_context_sql",
+                {
+                    "path": "facts.db",
+                    "sql": "SELECT id, label FROM facts",
+                    "limit": 2,
+                },
+                "sql",
+            ),
+        ]
+    )
+
+    result = ExplorerRunner(
+        model=model,
+        config=ExplorerConfig(max_steps=5),
+    ).run(task, ExploreInput())
+
+    assert result.fallback_used is True
+    assert {item["source_tool"] for item in result.report["evidence_summaries"]} == {
+        "preview_file",
+        "grep_context",
+        "execute_context_sql",
+    }
+    assert any(key.startswith("preview:") for key in result.report["value_samples"])
+    assert any(key.startswith("grep:") for key in result.report["value_samples"])
+    assert any(key.startswith("sql:") for key in result.report["value_samples"])
+    assert {"inspect:1", "preview:1"}.issubset(
+        result.report["schema_map"]["sales.csv"]["evidence_refs"]
+    )
+
+
+def test_budget_warnings_and_final_retry_are_observable(tmp_path):
+    task = _task(tmp_path)
+    responses = [_single_response("inspect_files", {}, "inspect")]
+    responses.extend(
+        _single_response("grep_context", {"pattern": "amount"}, f"grep-{index}")
+        for index in range(2, 10)
+    )
+    responses.extend(
+        [
+            _single_response("grep_context", {"pattern": "amount"}, "blocked-final"),
+            _single_response("report", _report(), "retry-report"),
+        ]
+    )
+    events = []
+    model = ScriptedModelAdapter(responses)
+
+    result = ExplorerRunner(
+        model=model,
+        config=ExplorerConfig(max_steps=10),
+        event_sink=lambda kind, payload: events.append((kind, payload)),
+    ).run(task, ExploreInput())
+
+    assert result.success is True
+    assert result.steps_used == 10
+    levels = [payload["level"] for kind, payload in events if kind == "explorer_budget_warning"]
+    assert levels == ["warning", "critical"]
+    assert model.requested_tool_names[-2:] == [("report",), ("report",)]
+    assert any(
+        kind == "explorer_final_report_retry" and payload["retry_index"] == 1
+        for kind, payload in events
+    )
 
 
 def test_inspect_failure_immediately_fails_open(tmp_path, monkeypatch):

@@ -198,7 +198,7 @@ Explorer 是唯一的局部例外：其首轮必须单独调用 `inspect_files({
 | 工具 | 作用 | 输入 |
 | --- | --- | --- |
 | `list_context` | 列出 `context/` 下的文件和目录。 | `max_depth` |
-| `explore` | 启动一次受限的 Phase 1 发现子 Agent；它先扫描文件、显式预览每个 `knowledge.md`，再按需使用有界 preview、grep 和只读 SQL，最终返回带证据引用的数据地图。成功或 fail-open 后都会移除。 | 无（`{}`） |
+| `explore` | 启动一次受限的 Phase 1 发现子 Agent；它先扫描文件、显式预览每个 `knowledge.md`，再按需使用有界 preview、grep 和只读 SQL。模型只提交语义增量，运行时从全部成功 observation 确定性合并最终数据地图；成功或 fail-open 后都会移除。 | 无（`{}`） |
 | `read_csv` | 读取 CSV 预览。 | `path`、`max_rows` |
 | `read_json` | 读取 JSON 预览。 | `path`、`max_chars` |
 | `read_doc` | 读取文本文档预览。 | `path`、`max_chars` |
@@ -210,7 +210,10 @@ Explorer 是唯一的局部例外：其首轮必须单独调用 `inspect_files({
 所有文件路径都必须是相对于任务 `context/` 目录的相对路径。
 `explore` 内部的子 Agent 注册表只包含 `inspect_files`、`preview_file`、
 `grep_context`、有界只读 `execute_context_sql` 和终止工具 `report`；这些发现工具不会与
-主 Agent 的常规计算工具同时暴露。
+主 Agent 的常规计算工具同时暴露。达到 70% 和 90% 轮次预算时，运行时会提醒子 Agent
+尽快报告；最后一轮只允许 `report`，非法终止最多获得两次不增加 Explorer 步数的纠正
+重试。即使最终没有合法 `report`，fallback 仍会汇总此前所有成功的 inspect、preview、
+grep 和 SQL observation，而不是丢弃深层探索结果。
 
 ## 输出
 

@@ -201,7 +201,7 @@ The baseline exposes these tools to the model:
 | Tool | Purpose | Inputs |
 | --- | --- | --- |
 | `list_context` | List files and directories under `context/`. | `max_depth` |
-| `explore` | Launch one bounded Phase 1 discovery sub-agent. It inspects files, explicitly previews every `knowledge.md`, and may use bounded preview, grep, and read-only SQL before returning an evidence-backed data map. It is removed after the call even on fail-open. | none (`{}`) |
+| `explore` | Launch one bounded Phase 1 discovery sub-agent. It inspects files, explicitly previews every `knowledge.md`, and may use bounded preview, grep, and read-only SQL. The model submits only semantic increments; the runtime deterministically merges the final data map from every successful observation. It is removed after the call even on fail-open. | none (`{}`) |
 | `read_csv` | Read a CSV preview. | `path`, `max_rows` |
 | `read_json` | Read a JSON preview. | `path`, `max_chars` |
 | `read_doc` | Read a text document preview. | `path`, `max_chars` |
@@ -214,6 +214,10 @@ All file paths passed to tools must be relative to the task `context/` directory
 Inside `explore`, the child registry is limited to `inspect_files`, `preview_file`,
 `grep_context`, bounded read-only `execute_context_sql`, and terminal `report`. These child
 tools are never exposed to the main Agent at the same time as its normal computation tools.
+The runtime reminds the child to converge at 70% and 90% of its turn budget. The final turn
+accepts only `report`, with up to two corrective retries that do not consume additional
+Explorer steps. If no valid report is produced, fallback still merges every successful
+inspect, preview, grep, and SQL observation instead of discarding deeper discovery.
 
 ## Outputs
 

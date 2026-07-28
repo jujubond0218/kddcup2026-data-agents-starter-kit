@@ -22,32 +22,43 @@ Markdown、文本和文本型 PDF，返回相对路径、类型、大小、schem
 `PRAGMA` 或 `EXPLAIN`，最多返回 200 行，并通过只读连接、`query_only`、语句校验和执行
 时限共同拒绝写入、ATTACH、建索引及长时间查询。
 
-报告 schema 为 `files`、`schema_map`、`knowledge`、`etl_candidates`、`join_paths`、
-`value_samples` 和 `warnings`。所有知识规则、值样本、连接与 warning 都必须引用真实的
-inspect/preview/grep/SQL evidence ID；所有连接始终标记为 candidate。`etl_candidates`
-仅是咨询性发现，本 PR 不执行 ETL，也不因没有 ETL 产物拒绝报告。
+模型调用 `report` 时不再复制完整文件清单、schema、样本和 evidence 索引，只提交
+`selected_sources`、`field_semantics`、`knowledge`、`etl_candidates`、
+`join_paths`、`warnings` 和 `uncertainties` 这些语义增量。运行时以不可变 observation
+作为事实来源，自动生成并合并 `files`、`schema_map`、`value_samples`、
+`evidence_summaries` 和 evidence 引用，再叠加证据支持的语义增量。未知路径、字段或
+evidence 引用只会忽略对应语义项并产生 warning，不会让已经取得的确定性数据地图整体
+失效。所有连接始终标记为 candidate；`etl_candidates` 仅是咨询性发现，本 PR 不执行
+ETL，也不因没有 ETL 产物拒绝报告。
 
 ## 预算、协议与 fail-open
 
-Explorer 默认最多 10 个模型轮次，软墙钟上限为 60 秒；10 轮是复杂任务的硬上限，不是
-期望平均值。`inspect_files` 与 `report` 必须各自独占一轮；中间轮次最多包含两个独立
-发现工具调用，运行时按原顺序执行，并为每个调用返回匹配原始 `tool_call_id` 的独立
-observation。子 Agent 每轮只看到当前阶段合法的工具：首轮只有 `inspect_files`，没有
-SQLite 来源时不暴露 SQL，最后一轮只有 `report`。`explore` 和 `inspect_files` 的公开
-schema 仍为空对象；对于部分 OpenAI-compatible 模型为无参数工具生成的无意义占位字段，
-运行时仅在这两个空输入边界丢弃字段，避免参数形状错误阻止 fail-open。主 Agent 的
-“一轮一个工具”协议不变。
+Explorer 默认最多 10 个普通模型轮次，软墙钟上限为 60 秒；10 轮是复杂任务的硬上限，
+不是期望平均值。运行时在达到 70% 和 90% 轮次预算时分别注入收敛提醒并记录聚合事件。
+`inspect_files` 与 `report` 必须各自独占一轮；中间轮次最多包含两个独立发现工具调用，
+运行时按原顺序执行，并为每个调用返回匹配原始 `tool_call_id` 的独立 observation。子
+Agent 每轮只看到当前阶段合法的工具：首轮只有 `inspect_files`，没有 SQLite 来源时不
+暴露 SQL，最后一轮只有 `report`。若最后一轮没有调用 report，或 report 参数/语义契约
+被拒绝，运行时最多再请求两次只允许 report 的纠正响应；这些请求不增加
+`steps_used`，但仍受 60 秒软时限、模型请求超时和 usage/事件记录约束。
+
+`explore` 和 `inspect_files` 的公开 schema 仍为空对象；对于部分 OpenAI-compatible
+模型为无参数工具生成的无意义占位字段，运行时仅在这两个空输入边界丢弃字段，避免参数
+形状错误阻止 fail-open。主 Agent 的“一轮一个工具”协议不变。
 
 扫描默认最多处理 64 个文件、总读取 4 MiB、普通单文件 256 KiB，文本型 PDF 最多读取
 2 MiB 和前三页；inspect 结果最多 12,000 字符，单个 preview 最多 2,000 字符，正常报告
 最多 4,000 字符且 preview 最多两次。所有路径限制在任务 `context/` 内。损坏文件、非法
 正则、越权路径、超限与不支持输入返回结构化可恢复错误或 warning。
 
-若模型失败、10 轮内没有合法 report、子工具失败或到达 60 秒软时限，运行时使用已经成功
-取得的 inspect/preview/grep/SQL observation 合成有界 fallback 数据地图；没有证据时也
-返回结构化失败，然后恢复主 Agent 原工具。Explorer 生命周期和工具聚合信息写入
-`events.jsonl`，不写原始报告或样本；主 Trace、模型请求超时与重试、120 秒任务硬超时、
-恢复和失败重跑语义保持不变。
+正常 report 与 fallback 共用同一个确定性汇总器。若模型失败、10 轮及免费终止重试内
+没有合法 report、子工具失败或到达 60 秒软时限，fallback 会吸收每个成功的
+inspect/preview/grep/SQL observation，保留其文件、schema、样本、匹配结果、SQL 结果摘要
+和 evidence 引用；只有模型语义增量会缺失。输出超过 12,000 字符时优先裁剪重复或咨询性
+内容，再裁剪深层 observation 摘要。没有证据时仍返回结构化失败，然后恢复主 Agent 原
+工具。Explorer 生命周期、预算提醒和免费重试的聚合信息写入 `events.jsonl`，不写原始
+报告或样本；主 Trace、模型请求超时与重试、120 秒任务硬超时、恢复和失败重跑语义保持
+不变。
 
 ## 历史实验
 
