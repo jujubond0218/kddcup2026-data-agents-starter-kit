@@ -300,10 +300,12 @@ Workflow:
    output fields, knowledge, and joins. For each requirement, name only candidate
    paths and fields that inspect_files actually returned. Mark needs_discovery=true
    only when inspect evidence is insufficient. Multiple candidate_fields mean an
-   explicit ambiguity that must be checked, not a guessed relationship. Derive
+   explicit ambiguity that should be checked, not a guessed relationship. Derive
    requirements and search_terms only from the question. For a question phrase
    that can map to several real fields, lock every plausible field; do not add a
-   field merely because its name is similar.
+   field merely because its name is similar. The runtime normalizes ambiguity flags
+   and adds any required knowledge.md review, so submit the semantic plan once
+   instead of retrying it for bookkeeping details.
 3. After locking, every preview_file, grep_context, and execute_context_sql call
    must cite locked requirement_ids, candidate target_fields, and a concise purpose.
    Do not explore a path or field outside the locked plan. If inspect_files lists
@@ -311,12 +313,14 @@ Workflow:
    preview_file for every listed knowledge.md before report.
 4. Use at most two independent tools in one turn. Targeted preview_file,
    grep_context, and read-only execute_context_sql calls may share a turn.
-5. The runtime tracks coverage of the immutable requirements and exposes report
-   as soon as every needs_discovery requirement has relevant evidence. Resolve
+5. The runtime tracks coverage of the immutable requirements. Starting with Turn
+   3, report is available alongside discovery tools after required knowledge review;
+   use it as soon as the evidence needed by the question is sufficient. Resolve
    schema ambiguity by comparing candidate values, value ambiguity with exact
    observed categories and knowledge rules, and numeric references with observed
    ranges. Leave vague semantics unresolved when evidence cannot decide. Do not
-   cross-check already covered requirements in extra sources.
+   cross-check already covered requirements in extra sources, and normally finish
+   by Turn 6 even though the hard safety limit is larger.
 6. report must be the only tool call in its turn and is the only normal way to
    finish. An incomplete semantic report is better than no report.
 
@@ -502,6 +506,8 @@ class _ExplorerTools:
             )
 
         known_fields = self._known_fields()
+        normalized_requirements: list[LockedRequirement] = []
+        normalized_ambiguities = 0
         for requirement in arguments.requirements:
             unknown_paths = set(requirement.candidate_paths) - self.discovered_paths
             if unknown_paths:
@@ -523,44 +529,74 @@ class _ExplorerTools:
                         f"Inventory does not contain candidate field "
                         f"{candidate.path}.{candidate.field}.",
                     )
-            if len(requirement.candidate_fields) > 1 and not requirement.needs_discovery:
-                return _error_result(
-                    "AMBIGUITY_REQUIRES_DISCOVERY",
-                    f"Requirement {requirement.id} has multiple candidate fields and must "
-                    "set needs_discovery=true.",
+            needs_discovery = requirement.needs_discovery or len(requirement.candidate_fields) > 1
+            if needs_discovery != requirement.needs_discovery:
+                normalized_ambiguities += 1
+            normalized_requirements.append(
+                requirement.model_copy(
+                    update={"needs_discovery": needs_discovery},
                 )
+            )
 
         uncovered_knowledge = self.knowledge_paths - {
             path
-            for requirement in arguments.requirements
+            for requirement in normalized_requirements
             if requirement.kind == "knowledge" and requirement.needs_discovery
             for path in requirement.candidate_paths
         }
-        if uncovered_knowledge:
-            return _error_result(
-                "KNOWLEDGE_REQUIREMENT_MISSING",
-                f"Add needs_discovery knowledge requirements for: {sorted(uncovered_knowledge)}",
+        used_ids = {requirement.id for requirement in normalized_requirements}
+        for index, path in enumerate(sorted(uncovered_knowledge), start=1):
+            identifier = "knowledge_context"
+            if identifier in used_ids:
+                identifier = f"knowledge_context_{index}"
+            while identifier in used_ids:
+                index += 1
+                identifier = f"knowledge_context_{index}"
+            used_ids.add(identifier)
+            normalized_requirements.append(
+                LockedRequirement(
+                    id=identifier,
+                    kind="knowledge",
+                    description="Review task-provided knowledge rules relevant to the question.",
+                    candidate_paths=[path],
+                    candidate_fields=[],
+                    search_terms=[],
+                    needs_discovery=True,
+                )
             )
 
-        self.locked_requirements = {item.id: item for item in arguments.requirements}
-        self.requirement_call_counts = {item.id: 0 for item in arguments.requirements}
+        normalized_rendered = json.dumps(
+            [item.model_dump(mode="json") for item in normalized_requirements],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        if len(normalized_rendered) > self.config.max_report_chars:
+            return _error_result(
+                "REQUIREMENT_PLAN_TOO_LARGE",
+                f"Normalized requirement plan exceeds {self.config.max_report_chars} characters.",
+            )
+
+        self.locked_requirements = {item.id: item for item in normalized_requirements}
+        self.requirement_call_counts = {item.id: 0 for item in normalized_requirements}
         self.requirements_locked = True
-        ambiguous = [item.id for item in arguments.requirements if len(item.candidate_fields) > 1]
+        ambiguous = [item.id for item in normalized_requirements if len(item.candidate_fields) > 1]
         emit_event(
             self.event_sink,
             "explorer_requirements_locked",
             {
-                "requirement_count": len(arguments.requirements),
+                "requirement_count": len(normalized_requirements),
                 "ambiguity_count": len(ambiguous),
+                "normalized_ambiguity_count": normalized_ambiguities,
+                "added_knowledge_requirement_count": len(uncovered_knowledge),
                 "candidate_path_count": len(
                     {
                         path
-                        for requirement in arguments.requirements
+                        for requirement in normalized_requirements
                         for path in requirement.candidate_paths
                     }
                 ),
                 "candidate_field_count": sum(
-                    len(requirement.candidate_fields) for requirement in arguments.requirements
+                    len(requirement.candidate_fields) for requirement in normalized_requirements
                 ),
             },
         )
@@ -570,9 +606,13 @@ class _ExplorerTools:
                 "status": "locked",
                 "requirement_ids": list(self.locked_requirements),
                 "needs_discovery": [
-                    item.id for item in arguments.requirements if item.needs_discovery
+                    item.id for item in normalized_requirements if item.needs_discovery
                 ],
                 "ambiguous_requirement_ids": ambiguous,
+                "runtime_normalizations": {
+                    "ambiguity_flags": normalized_ambiguities,
+                    "knowledge_requirements": len(uncovered_knowledge),
+                },
             },
         )
 
@@ -610,33 +650,27 @@ class _ExplorerTools:
                     f"{self._MAX_DISCOVERY_CALLS_PER_REQUIREMENT} discovery calls.",
                 )
 
-        allowed_fields = {
-            self._field_identity(candidate)
+        allowed_candidates = [
+            candidate
             for requirement_id in arguments.requirement_ids
             for candidate in self.locked_requirements[requirement_id].candidate_fields
+            if candidate.path == path
+        ]
+        allowed_by_identity = {
+            self._field_identity(candidate): candidate for candidate in allowed_candidates
         }
-        for candidate in arguments.target_fields:
-            if candidate.path != path or self._field_identity(candidate) not in allowed_fields:
-                return _error_result(
-                    "FIELD_OUTSIDE_REQUIREMENT",
-                    f"Target field {candidate.path}.{candidate.field} is not a locked "
-                    "candidate for this discovery call.",
-                )
-        for requirement_id in arguments.requirement_ids:
-            requirement = self.locked_requirements[requirement_id]
-            candidates_for_path = {
-                self._field_identity(candidate)
-                for candidate in requirement.candidate_fields
-                if candidate.path == path
-            }
-            if candidates_for_path and not candidates_for_path.intersection(
-                self._field_identity(candidate) for candidate in arguments.target_fields
-            ):
-                return _error_result(
-                    "TARGET_FIELD_REQUIRED",
-                    f"Discovery for requirement {requirement_id} must name at least one "
-                    "locked target field on this path.",
-                )
+        normalized_targets = [
+            allowed_by_identity[self._field_identity(candidate)]
+            for candidate in arguments.target_fields
+            if candidate.path == path and self._field_identity(candidate) in allowed_by_identity
+        ]
+        if not normalized_targets and allowed_candidates:
+            normalized_targets = list(allowed_by_identity.values())
+        arguments.target_fields = list(
+            {
+                self._field_identity(candidate): candidate for candidate in normalized_targets
+            }.values()
+        )
         return None
 
     def _record_discovery_call(self, arguments: _TargetedDiscoveryInput) -> None:
@@ -1697,7 +1731,8 @@ class _ExplorerTools:
             specs.pop("execute_context_sql")
         if self.preview_calls >= self.config.max_preview_calls:
             specs.pop("preview_file")
-        specs.pop("report")
+        if self.knowledge_paths - self.knowledge_attempted:
+            specs.pop("report")
         return ToolRegistry(specs=specs)
 
 

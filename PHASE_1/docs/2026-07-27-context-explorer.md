@@ -20,8 +20,10 @@ Markdown、文本和文本型 PDF，返回相对路径、类型、大小、schem
 `lock_requirements` 把问题拆成最多 12 个稳定的小写需求 ID，覆盖实体、指标、过滤条件、
 时间范围、输出字段、知识规则和连接关系。每项需求只能声明 inspect 已发现的候选路径和
 字段，并明确 `needs_discovery`；一个需求出现多个真实候选字段时即表示显式待消歧状态，
-不能把命名相似直接当作已确认语义。锁定成功后计划不可修改，事件只记录需求、候选与
-歧义数量，不记录题目文本或完整计划。
+不能把命名相似直接当作已确认语义。运行时会自动把多候选字段规范为待探索需求，并为
+inspect 发现但模型漏列的 `knowledge.md` 补充读取需求，避免子 Agent 为协议 bookkeeping
+反复重提整份计划。锁定成功后计划不可修改，事件只记录需求、候选、规范化与歧义数量，
+不记录题目文本或完整计划。
 
 `preview_file` 对 inspect 已发现且已锁定为候选的单个文件做更深入但有界的读取。
 `grep_context` 在一个已锁定的文本来源或 SQLite 文本列中执行大小写不敏感的有界正则
@@ -32,7 +34,9 @@ Markdown、文本和文本型 PDF，返回相对路径、类型、大小、schem
 
 每次 `preview_file`、`grep_context` 和 `execute_context_sql` 都必须携带一个到四个已
 锁定的 `requirement_ids`、简短 `purpose`，以及本次实际检查的候选 `target_fields`。
-运行时拒绝需求计划之外的路径、字段和新 ID，并将每项需求的深层调用限制为三次。模型
+运行时仍拒绝计划之外的路径和新 ID，但会丢弃未锁定的 `target_fields`；当模型漏写字段
+且当前路径存在锁定候选时，运行时自动绑定这些候选，避免把可确定修复的参数遗漏变成额外
+模型轮次。每项需求的深层调用仍限制为三次。模型
 调用 `report` 时只提交语义增量：`relevant_evidence`、`requirement_resolutions`、
 `selected_sources`、`field_semantics`、`knowledge`、`etl_candidates`、`join_paths`、
 `warnings` 和 `uncertainties`；`task_requirements`、文件清单、schema 与 evidence 来源由
@@ -43,7 +47,9 @@ Markdown、文本和文本型 PDF，返回相对路径、类型、大小、schem
 运行时确定性跟踪需求覆盖度：`needs_discovery=false` 的需求由 inspect 满足；普通发现
 需求至少需要一条成功且绑定一致的深层 evidence；有多个候选字段的需求必须实际覆盖所有
 候选字段，或由绑定到该需求的 `knowledge.md` evidence 支持。覆盖完成后子 Agent 只再看到
-`report`，避免对已满足需求继续交叉检查。`requirement_resolutions` 只能在已锁定候选中
+`report`，避免对已满足需求继续交叉检查。在必须读取的 knowledge 已尝试后，未完全覆盖时
+也会同时开放 `report`，允许模型把无法继续判定的需求标为 `unresolved` 后及时结束，而
+不是为了满足机械覆盖条件耗尽轮次。`requirement_resolutions` 只能在已锁定候选中
 选择或排除字段，并引用已经选中的相关 evidence；无法确定时必须保留为 `unresolved`。
 
 运行时始终生成全文件的极简背景 `files/schema_map`；未选择来源最多保留 inspect 得到的
@@ -61,8 +67,9 @@ Explorer 默认最多 10 个普通模型轮次，软墙钟上限为 60 秒；10 
 `inspect_files`、`lock_requirements` 与 `report` 必须各自独占一轮；中间轮次最多包含两个独立发现工具调用，
 运行时按原顺序执行，并为每个调用返回匹配原始 `tool_call_id` 的独立 observation。子
 Agent 每轮只看到当前阶段合法的工具：首轮只有 `inspect_files`，第二轮只有
-`lock_requirements`，没有 SQLite 来源时不暴露 SQL，需求覆盖完成或最后一轮时只有
-`report`。若最后一轮没有调用 report，或 report 参数/语义契约
+`lock_requirements`，没有 SQLite 来源时不暴露 SQL；knowledge 读取完成后，`report`
+与仍可用的定向发现工具同时开放，需求覆盖完成或最后一轮时则只开放 `report`。若最后
+一轮没有调用 report，或 report 参数/语义契约
 被拒绝，运行时最多再请求两次只允许 report 的纠正响应；这些请求不增加
 `steps_used`，但仍受 60 秒软时限、模型请求超时和 usage/事件记录约束。
 
@@ -327,3 +334,31 @@ Runner、主步骤、计算调用和 Token 均改善，但 Explorer 本身没有
 墙钟略有增加。相对固定门槛，本轮只有 1 题非零且目标集分数和为 1.00，仍低于至少 2 题
 非零和 1.95 分，因此不运行 50 题、不创建 PR。该单轮结果只能描述为“相关性投影带来
 局部恢复并减少主 Agent 重复探索”，不能证明稳定的语义准确率提升。
+
+## 需求锁定与候选字段覆盖的 9 题实验
+
+2026-07-28 在提交 `ad03ef6` 上运行同一固定 9 题。该版本在 inspect 后增加独占的
+`lock_requirements`，将实体、指标、过滤、时间、输出和知识映射到真实候选路径与字段，
+并要求显式混淆字段取得覆盖证据后才开放 `report`。结构边界生效，但一次性锁定接口过严：
+9 题对 `lock_requirements` 共发起 41 次调用，其中 23 次因多候选字段没有同时声明
+`needs_discovery` 被拒绝，8 次因模型漏建 knowledge 需求被拒绝。后续又出现 7 次阶段性
+未知工具、4 次遗漏目标字段，以及少量候选字段或路径不匹配。
+
+| 指标 | 相关性投影 `1db3867` | 严格需求锁定 `ad03ef6` |
+| --- | ---: | ---: |
+| 目标集非零题 / 分数和 | 1 / 1.00 | 1 / 1.00 |
+| Runner 成功 / 缺失 | 7 / 2 | 5 / 4 |
+| Explorer 正常 report / fallback | 9 / 0 | 6 / 3 |
+| Explorer 请求 / 平均普通轮数 | 84 / 9.11 | 95 / 10.00 |
+| 主 Agent 完成步骤 | 69 | 86 |
+| 主 SQL/Python 调用 | 29 | 19 |
+| 成功模型请求 / 总 Token | 153 / 921,027 | 182 / 1,167,551 |
+| 事件时间跨度 | 357.656 秒 | 421.250 秒 |
+
+只有 `task_89` 非零；4 个任务触发 120 秒硬超时，3 个 Explorer 使用 fallback。该结果
+没有通过 Runner、非零题数和分数门槛，因此不运行 50 题。负向变化的主要可观测原因不是
+“没有拆题”，而是模型需要逐项满足运行时可确定补全的 bookkeeping，10 轮大量消耗在
+重提锁定参数和补字段，而不是查证据。后续版本因此保留不可变需求与路径安全边界，但由
+运行时自动规范多候选字段的探索标记、补充 knowledge 需求、收敛目标字段，并在 knowledge
+读取后允许提前提交 unresolved report；该修复需在同一 9 题上重新验证，不能根据结构测试
+预先宣称分数提升。

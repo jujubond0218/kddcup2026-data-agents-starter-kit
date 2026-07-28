@@ -212,8 +212,9 @@ Explorer 是唯一的局部例外：其首轮必须单独调用 `inspect_files({
 `explore` 内部的子 Agent 注册表只包含 `inspect_files`、`lock_requirements`、
 `preview_file`、`grep_context`、有界只读 `execute_context_sql` 和终止工具 `report`；
 这些发现工具不会与主 Agent 的常规计算工具同时暴露。锁定计划成功后不可修改，深层调用
-必须绑定真实候选路径/字段，每项需求最多三次；显式混淆字段全部取得证据后，运行时只再
-开放 `report`。达到 70% 和 90% 轮次预算时仍会提醒收敛，非法终止最多获得两次免费纠正
+必须绑定真实候选路径/字段，每项需求最多三次；运行时自动规范多候选字段的探索标记并补充
+遗漏的 knowledge 读取需求。knowledge 已尝试后可提前提交 `report`，显式混淆字段全部
+取得证据后则只再开放 `report`。达到 70% 和 90% 轮次预算时仍会提醒收敛，非法终止最多获得两次免费纠正
 重试。模型在 `report` 中只提交相关 evidence、需求消歧和其他语义增量；文件清单、schema、
 锁定需求与 evidence 来源由运行时合并。即使最终没有合法 `report`，fallback 也会复用
 锁定需求并最多选择 8 条较高优先级 evidence，避免丢失探索成果或注入全部中间尝试。

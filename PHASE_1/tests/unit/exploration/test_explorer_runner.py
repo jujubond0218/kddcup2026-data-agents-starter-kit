@@ -372,6 +372,47 @@ def test_knowledge_must_be_attempted_before_report(tmp_path):
     assert accepted.ok is True
 
 
+def test_lock_normalizes_ambiguity_and_adds_missing_knowledge_requirement(tmp_path):
+    task = _task(tmp_path, knowledge=True)
+    tools = _ExplorerTools(config=ExplorerConfig())
+    tools.inspect(task, InspectFilesInput())
+    payload = {
+        "requirements": [
+            {
+                "id": "measure_sales",
+                "kind": "measure",
+                "description": "Resolve the requested sales measure.",
+                "candidate_paths": ["sales.csv"],
+                "candidate_fields": [
+                    {"path": "sales.csv", "table": None, "field": "amount"},
+                    {"path": "sales.csv", "table": None, "field": "customer_id"},
+                ],
+                "search_terms": ["sales"],
+                "needs_discovery": False,
+            }
+        ]
+    }
+
+    result = tools.lock_requirements(
+        task,
+        LockRequirementsInput.model_validate(payload),
+    )
+
+    assert result.ok is True
+    assert result.content["runtime_normalizations"] == {
+        "ambiguity_flags": 1,
+        "knowledge_requirements": 1,
+    }
+    assert tools.locked_requirements["measure_sales"].needs_discovery is True
+    knowledge = tools.locked_requirements["knowledge_context"]
+    assert knowledge.kind == "knowledge"
+    assert knowledge.candidate_paths == ["knowledge.md"]
+    assert set(tools.registry().specs) == {
+        "grep_context",
+        "preview_file",
+    }
+
+
 def test_knowledge_detection_is_case_insensitive(tmp_path):
     task = _task(tmp_path, knowledge=True)
     (task.context_dir / "knowledge.md").rename(task.context_dir / "Knowledge.MD")
@@ -484,7 +525,7 @@ def test_requirements_lock_only_inventory_paths_and_fields_and_become_immutable(
     assert rejected_field.error_code == "UNKNOWN_CANDIDATE_FIELD"
     assert accepted.ok is True
     assert repeated.error_code == "REQUIREMENTS_ALREADY_LOCKED"
-    assert set(tools.registry().specs) == {"grep_context", "preview_file"}
+    assert set(tools.registry().specs) == {"grep_context", "preview_file", "report"}
 
 
 def test_locked_candidates_constrain_paths_fields_and_per_requirement_budget(tmp_path):
@@ -510,8 +551,10 @@ def test_locked_candidates_constrain_paths_fields_and_per_requirement_budget(tmp
     calls = [tools.grep(task, _grep_input("C1")) for _ in range(4)]
 
     assert outside_path.error_code == "PATH_OUTSIDE_REQUIREMENT"
-    assert outside_field.error_code == "FIELD_OUTSIDE_REQUIREMENT"
-    assert all(result.ok for result in calls[:3])
+    assert outside_field.ok is True
+    assert outside_field.content["target_fields"] == []
+    assert all(result.ok for result in calls[:2])
+    assert calls[2].error_code == "REQUIREMENT_DISCOVERY_BUDGET_EXHAUSTED"
     assert calls[3].error_code == "REQUIREMENT_DISCOVERY_BUDGET_EXHAUSTED"
 
 
@@ -557,7 +600,7 @@ def test_ambiguous_fields_require_targeted_coverage_and_report_resolution(tmp_pa
 
     assert locked.ok is True
     assert tools.requirements_ready_for_report() is False
-    assert "report" not in tools.registry().specs
+    assert "report" in tools.registry().specs
 
     second = tools.grep(
         task,

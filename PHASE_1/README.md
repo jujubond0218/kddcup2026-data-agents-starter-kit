@@ -215,8 +215,10 @@ All file paths passed to tools must be relative to the task `context/` directory
 Inside `explore`, the child registry is limited to `inspect_files`, `lock_requirements`,
 `preview_file`, `grep_context`, bounded read-only `execute_context_sql`, and terminal `report`.
 The locked plan is immutable. Every deep call must bind to real candidate paths and fields, with
-at most three calls per requirement; once all required or ambiguous fields have evidence, only
-`report` remains available. The runtime still issues 70% and 90% convergence reminders and
+at most three calls per requirement. The runtime normalizes ambiguous-field discovery flags and
+adds omitted knowledge-review requirements. After knowledge review is attempted, `report` is
+available for an early unresolved result; once all required or ambiguous fields have evidence,
+only `report` remains available. The runtime still issues 70% and 90% convergence reminders and
 allows up to two free corrective final retries. The model submits only relevant evidence,
 requirement resolutions, and other semantic increments; the runtime merges the file list,
 schemas, locked requirements, and evidence provenance. If no valid report is produced, fallback
