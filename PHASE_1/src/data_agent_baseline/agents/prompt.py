@@ -31,9 +31,11 @@ def build_system_prompt(
         prompt += (
             "\n7. Your first tool call must be `explore({})`. It launches a discovery-only "
             "sub-agent and is available for exactly one call.\n"
-            "8. Use the returned files, schemas, knowledge evidence, value samples, and warnings "
-            "as a data map. Treat reported joins and ETL entries as candidates, verify them with "
-            "normal tools before computation, and prefer actual queried data on conflict."
+            "8. Use files and schemas as compact background context. Prioritize selected_sources "
+            "and relevant_evidence because deep preview/grep/SQL observations are projected only "
+            "when tied to explicit task_requirements. Treat joins, ETL entries, field semantics, "
+            "and uncertainties as candidates; verify them with normal tools before computation, "
+            "and prefer actual queried data on conflict."
         )
     return prompt
 

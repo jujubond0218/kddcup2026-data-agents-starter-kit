@@ -22,14 +22,22 @@ Markdown、文本和文本型 PDF，返回相对路径、类型、大小、schem
 `PRAGMA` 或 `EXPLAIN`，最多返回 200 行，并通过只读连接、`query_only`、语句校验和执行
 时限共同拒绝写入、ATTACH、建索引及长时间查询。
 
-模型调用 `report` 时不再复制完整文件清单、schema、样本和 evidence 索引，只提交
-`selected_sources`、`field_semantics`、`knowledge`、`etl_candidates`、
-`join_paths`、`warnings` 和 `uncertainties` 这些语义增量。运行时以不可变 observation
-作为事实来源，自动生成并合并 `files`、`schema_map`、`value_samples`、
-`evidence_summaries` 和 evidence 引用，再叠加证据支持的语义增量。未知路径、字段或
-evidence 引用只会忽略对应语义项并产生 warning，不会让已经取得的确定性数据地图整体
-失效。所有连接始终标记为 candidate；`etl_candidates` 仅是咨询性发现，本 PR 不执行
-ETL，也不因没有 ETL 产物拒绝报告。
+子 Agent 在 inspect 后先用稳定的小写 ID 表达题目需要的实体、指标、过滤条件、时间范围、
+输出字段、知识规则和连接关系。每次 `preview_file`、`grep_context` 和
+`execute_context_sql` 都必须携带一个到四个 `requirement_ids` 和简短 `purpose`；运行时
+将这些用途与不可变 evidence 一起保存。模型调用 `report` 时提交
+`task_requirements`、`relevant_evidence`、`selected_sources`、`field_semantics`、
+`knowledge`、`etl_candidates`、`join_paths`、`warnings` 和 `uncertainties`。一项
+`relevant_evidence` 只有在 evidence 存在、工具成功、支持的 requirement 已声明，且与
+工具调用时记录的 requirement 绑定一致时才会被接受。
+
+运行时始终生成全文件的极简背景 `files/schema_map`；未选择来源最多保留 inspect 得到的
+16 个基础字段。只有被 `relevant_evidence` 接受的 preview/grep/SQL observation 才能
+进入 `evidence_summaries`、深层 schema 和 `value_samples`。inspect 产生的弱
+relation candidates 不再自动变成 `join_paths`；连接必须由子 Agent 明确选择并引用相关
+证据。未知路径、字段、需求或 evidence 引用只会忽略对应语义项并产生 warning，不会让
+背景数据地图整体失效。所有连接始终标记为 candidate；`etl_candidates` 仅是咨询性发现，
+本 PR 不执行 ETL，也不因没有 ETL 产物拒绝报告。
 
 ## 预算、协议与 fail-open
 
@@ -51,14 +59,16 @@ Agent 每轮只看到当前阶段合法的工具：首轮只有 `inspect_files`�
 最多 4,000 字符且 preview 最多两次。所有路径限制在任务 `context/` 内。损坏文件、非法
 正则、越权路径、超限与不支持输入返回结构化可恢复错误或 warning。
 
-正常 report 与 fallback 共用同一个确定性汇总器。若模型失败、10 轮及免费终止重试内
-没有合法 report、子工具失败或到达 60 秒软时限，fallback 会吸收每个成功的
-inspect/preview/grep/SQL observation，保留其文件、schema、样本、匹配结果、SQL 结果摘要
-和 evidence 引用；只有模型语义增量会缺失。输出超过 12,000 字符时优先裁剪重复或咨询性
-内容，再裁剪深层 observation 摘要。没有证据时仍返回结构化失败，然后恢复主 Agent 原
-工具。Explorer 生命周期、预算提醒和免费重试的聚合信息写入 `events.jsonl`，不写原始
-报告或样本；主 Trace、模型请求超时与重试、120 秒任务硬超时、恢复和失败重跑语义保持
-不变。
+正常 report 与 fallback 共用同一个确定性投影器。若模型失败、10 轮及免费终止重试内
+没有合法 report、子工具失败或到达 60 秒软时限，fallback 从成功且带 requirement 绑定
+的深层 observation 中优先保留 knowledge 读取、每个“需求 × 工具”组合的最新 evidence，
+再按新近程度补足，最多选择 8 项。它根据工具调用时的 `purpose` 合成 fallback
+requirements，因此不需要依赖最终 report 才能筛选；未选择的中间尝试不会进入主报告。
+输出超过 12,000 字符时优先裁剪重复或咨询性内容，再裁剪深层 observation 摘要。没有
+证据时仍返回结构化失败，然后恢复主 Agent 原工具。Explorer 生命周期、预算提醒和免费
+重试的聚合信息写入 `events.jsonl`；完成事件只额外记录 requirement、相关 evidence、
+选中来源的数量和报告字符数，不写原始报告或样本。主 Trace、模型请求超时与重试、
+120 秒任务硬超时、恢复和失败重跑语义保持不变。
 
 ## 历史实验
 

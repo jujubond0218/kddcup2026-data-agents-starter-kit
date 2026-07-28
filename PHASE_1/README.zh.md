@@ -198,7 +198,7 @@ Explorer 是唯一的局部例外：其首轮必须单独调用 `inspect_files({
 | 工具 | 作用 | 输入 |
 | --- | --- | --- |
 | `list_context` | 列出 `context/` 下的文件和目录。 | `max_depth` |
-| `explore` | 启动一次受限的 Phase 1 发现子 Agent；它先扫描文件、显式预览每个 `knowledge.md`，再按需使用有界 preview、grep 和只读 SQL。模型只提交语义增量，运行时从全部成功 observation 确定性合并最终数据地图；成功或 fail-open 后都会移除。 | 无（`{}`） |
+| `explore` | 启动一次受限的 Phase 1 发现子 Agent；它先扫描文件、显式预览每个 `knowledge.md`，再按需使用有界 preview、grep 和只读 SQL。深层调用必须绑定题目需求，运行时只投影被报告选择的相关 evidence；成功或 fail-open 后都会移除。 | 无（`{}`） |
 | `read_csv` | 读取 CSV 预览。 | `path`、`max_rows` |
 | `read_json` | 读取 JSON 预览。 | `path`、`max_chars` |
 | `read_doc` | 读取文本文档预览。 | `path`、`max_chars` |
@@ -212,8 +212,10 @@ Explorer 是唯一的局部例外：其首轮必须单独调用 `inspect_files({
 `grep_context`、有界只读 `execute_context_sql` 和终止工具 `report`；这些发现工具不会与
 主 Agent 的常规计算工具同时暴露。达到 70% 和 90% 轮次预算时，运行时会提醒子 Agent
 尽快报告；最后一轮只允许 `report`，非法终止最多获得两次不增加 Explorer 步数的纠正
-重试。即使最终没有合法 `report`，fallback 仍会汇总此前所有成功的 inspect、preview、
-grep 和 SQL observation，而不是丢弃深层探索结果。
+重试。正常报告始终保留全文件的极简背景清单，但不会自动注入未选择的 preview、grep、
+SQL observation 或弱关系候选。即使最终没有合法 `report`，fallback 也会依据深层工具
+调用时记录的需求 ID 和用途，最多选择 8 条较高优先级 evidence，避免既丢失探索成果又把
+全部中间尝试交给主 Agent。
 
 ## 输出
 

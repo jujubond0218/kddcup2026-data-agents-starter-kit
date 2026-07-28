@@ -1,6 +1,8 @@
 import json
 import sqlite3
 
+import pytest
+
 from data_agent_baseline.agents.model import ModelResponse, ModelToolCall, ScriptedModelAdapter
 from data_agent_baseline.agents.react import ReActAgent
 from data_agent_baseline.benchmark.schema import PublicTask, TaskAssets, TaskRecord
@@ -63,6 +65,39 @@ def _single_response(name: str, arguments: dict, call_id: str) -> ModelResponse:
     return _response(_call(name, arguments, call_id))
 
 
+def _targeted(
+    arguments: dict,
+    *,
+    requirement_id: str = "source_data",
+    purpose: str = "Locate data required by the task.",
+) -> dict:
+    return {
+        **arguments,
+        "requirement_ids": [requirement_id],
+        "purpose": purpose,
+    }
+
+
+def _preview_input(path: str, *, requirement_id: str = "source_data") -> PreviewFileInput:
+    return PreviewFileInput.model_validate(_targeted({"path": path}, requirement_id=requirement_id))
+
+
+def _grep_input(
+    pattern: str,
+    *,
+    path: str | None = None,
+    requirement_id: str = "source_data",
+) -> GrepContextInput:
+    arguments = {"pattern": pattern}
+    if path is not None:
+        arguments["path"] = path
+    return GrepContextInput.model_validate(_targeted(arguments, requirement_id=requirement_id))
+
+
+def _sql_input(path: str, sql: str, *, limit: int = 200) -> ExplorerSqlInput:
+    return ExplorerSqlInput.model_validate(_targeted({"path": path, "sql": sql, "limit": limit}))
+
+
 def _report(
     *,
     inspect_ref: str = "inspect:1",
@@ -72,6 +107,14 @@ def _report(
 ) -> dict:
     del inspect_ref
     report = {
+        "task_requirements": [
+            {
+                "id": "source_data",
+                "kind": "output",
+                "description": "Locate the requested sales data.",
+            }
+        ],
+        "relevant_evidence": [],
         "selected_sources": ["sales.csv"],
         "field_semantics": [],
         "knowledge": [],
@@ -81,6 +124,7 @@ def _report(
         "uncertainties": [],
     }
     if sales_ref is not None:
+        report["relevant_evidence"].append({"evidence_id": sales_ref, "supports": ["source_data"]})
         report["field_semantics"].append(
             {
                 "path": "sales.csv",
@@ -91,6 +135,16 @@ def _report(
             }
         )
     if knowledge_ref is not None:
+        report["task_requirements"].append(
+            {
+                "id": "knowledge_rule",
+                "kind": "knowledge",
+                "description": "Review the task knowledge mapping.",
+            }
+        )
+        report["relevant_evidence"].append(
+            {"evidence_id": knowledge_ref, "supports": ["knowledge_rule"]}
+        )
         report["knowledge"].append(
             {
                 "path": knowledge_path,
@@ -122,8 +176,12 @@ def test_explorer_inspects_then_reads_knowledge_and_supports_two_calls_per_turn(
         [
             _single_response("inspect_files", {}, "inspect_call"),
             _response(
-                _call("preview_file", {"path": "knowledge.md"}, "knowledge_preview"),
-                _call("preview_file", {"path": "sales.csv"}, "sales_preview"),
+                _call(
+                    "preview_file",
+                    _targeted({"path": "knowledge.md"}, requirement_id="knowledge_rule"),
+                    "knowledge_preview",
+                ),
+                _call("preview_file", _targeted({"path": "sales.csv"}), "sales_preview"),
             ),
             _single_response(
                 "report",
@@ -167,14 +225,18 @@ def test_explorer_inspects_then_reads_knowledge_and_supports_two_calls_per_turn(
         "sales_preview",
     ]
     assert any(kind == "explorer_knowledge_reviewed" for kind, _ in events)
-    assert any(kind == "explorer_completed" for kind, _ in events)
+    completed = next(payload for kind, payload in events if kind == "explorer_completed")
+    assert completed["task_requirement_count"] == 2
+    assert completed["relevant_evidence_count"] == 2
+    assert completed["selected_source_count"] == 2
+    assert completed["report_chars"] > 0
 
 
 def test_explorer_requires_inspect_as_first_successful_turn(tmp_path):
     task = _task(tmp_path)
     model = ScriptedModelAdapter(
         [
-            _single_response("preview_file", {"path": "sales.csv"}, "premature"),
+            _single_response("preview_file", _targeted({"path": "sales.csv"}), "premature"),
             _single_response("inspect_files", {}, "inspect"),
             _single_response("report", _report(), "report"),
         ]
@@ -202,7 +264,7 @@ def test_explorer_rejects_more_than_two_calls_and_mixed_report(tmp_path):
             ),
             _single_response("inspect_files", {}, "inspect"),
             _response(
-                _call("preview_file", {"path": "sales.csv"}, "preview"),
+                _call("preview_file", _targeted({"path": "sales.csv"}), "preview"),
                 _call("report", _report(), "mixed_report"),
             ),
             _single_response("report", _report(), "report"),
@@ -232,7 +294,10 @@ def test_knowledge_must_be_attempted_before_report(tmp_path):
     tools = _ExplorerTools(config=ExplorerConfig())
     inspected = tools.inspect(task, InspectFilesInput())
     rejected = tools.report(task, ExplorerReportInput.model_validate(_report()))
-    previewed = tools.preview(task, PreviewFileInput(path="knowledge.md"))
+    previewed = tools.preview(
+        task,
+        _preview_input("knowledge.md", requirement_id="knowledge_rule"),
+    )
     accepted = tools.report(
         task,
         ExplorerReportInput.model_validate(_report(knowledge_ref=previewed.content["evidence_id"])),
@@ -256,7 +321,10 @@ def test_knowledge_detection_is_case_insensitive(tmp_path):
     (task.context_dir / "knowledge.md").rename(task.context_dir / "Knowledge.MD")
     tools = _ExplorerTools(config=ExplorerConfig())
     inspected = tools.inspect(task, InspectFilesInput())
-    previewed = tools.preview(task, PreviewFileInput(path="Knowledge.MD"))
+    previewed = tools.preview(
+        task,
+        _preview_input("Knowledge.MD", requirement_id="knowledge_rule"),
+    )
     accepted = tools.report(
         task,
         ExplorerReportInput.model_validate(
@@ -284,7 +352,10 @@ def test_knowledge_preview_failure_can_be_reported_as_evidence_warning(tmp_path,
         "data_agent_baseline.exploration.runner.preview_context_file",
         fail_preview,
     )
-    failed = tools.preview(task, PreviewFileInput(path="knowledge.md"))
+    failed = tools.preview(
+        task,
+        _preview_input("knowledge.md", requirement_id="knowledge_rule"),
+    )
     report = _report(inspect_ref=inspected.content["evidence_id"])
     report["warnings"].append(
         {
@@ -303,11 +374,11 @@ def test_preview_requires_inspection_known_path_and_budget(tmp_path):
     task = _task(tmp_path)
     tools = _ExplorerTools(config=ExplorerConfig(max_preview_calls=1))
 
-    before_inspect = tools.preview(task, PreviewFileInput(path="sales.csv"))
+    before_inspect = tools.preview(task, _preview_input("sales.csv"))
     tools.inspect(task, InspectFilesInput())
-    first = tools.preview(task, PreviewFileInput(path="sales.csv"))
-    second = tools.preview(task, PreviewFileInput(path="sales.csv"))
-    outside = tools.preview(task, PreviewFileInput(path="../outside.csv"))
+    first = tools.preview(task, _preview_input("sales.csv"))
+    second = tools.preview(task, _preview_input("sales.csv"))
+    outside = tools.preview(task, _preview_input("../outside.csv"))
 
     assert before_inspect.error_code == "INSPECT_REQUIRED"
     assert first.ok is True
@@ -316,14 +387,27 @@ def test_preview_requires_inspection_known_path_and_budget(tmp_path):
     assert outside.error_code == "PATH_NOT_INSPECTED"
 
 
+def test_deep_discovery_requires_stable_requirement_binding():
+    with pytest.raises(ValueError):
+        PreviewFileInput.model_validate({"path": "sales.csv"})
+    with pytest.raises(ValueError):
+        GrepContextInput.model_validate(
+            {
+                "pattern": "sales",
+                "requirement_ids": ["Invalid ID"],
+                "purpose": "Locate sales.",
+            }
+        )
+
+
 def test_grep_context_searches_text_and_rejects_invalid_regex(tmp_path):
     task = _task(tmp_path)
     tools = _ExplorerTools(config=ExplorerConfig())
     tools.inspect(task, InspectFilesInput())
 
-    found = tools.grep(task, GrepContextInput(pattern="C[12]"))
-    invalid = tools.grep(task, GrepContextInput(pattern="["))
-    unsafe_filter = tools.grep(task, GrepContextInput(pattern="C1", path="../outside"))
+    found = tools.grep(task, _grep_input("C[12]"))
+    invalid = tools.grep(task, _grep_input("["))
+    unsafe_filter = tools.grep(task, _grep_input("C1", path="../outside"))
 
     assert found.ok is True
     assert found.content["observation"]["match_count"] == 2
@@ -346,12 +430,12 @@ def test_grep_context_searches_sqlite_and_obeys_file_byte_budget(tmp_path):
     )
     tools.inspect(task, InspectFilesInput())
 
-    found = tools.grep(task, GrepContextInput(pattern="alpha", path="0facts.db"))
+    found = tools.grep(task, _grep_input("alpha", path="0facts.db"))
     bounded_tools = _ExplorerTools(
         config=ExplorerConfig(max_single_file_bytes=1, max_total_read_bytes=1)
     )
     bounded_tools.inspect(task, InspectFilesInput())
-    bounded = bounded_tools.grep(task, GrepContextInput(pattern="alpha", path="0facts.db"))
+    bounded = bounded_tools.grep(task, _grep_input("alpha", path="0facts.db"))
 
     assert found.ok is True
     assert found.content["observation"]["matches"][0]["table"] == "facts"
@@ -370,7 +454,7 @@ def test_grep_context_output_is_character_bounded(tmp_path):
     tools = _ExplorerTools(config=ExplorerConfig(max_inventory_chars=700))
     tools.inspect(task, InspectFilesInput())
 
-    result = tools.grep(task, GrepContextInput(pattern="match"))
+    result = tools.grep(task, _grep_input("match"))
 
     assert result.ok is True
     observation = result.content["observation"]
@@ -389,30 +473,30 @@ def test_explorer_sql_is_read_only_and_evidence_backed(tmp_path):
 
     selected = tools.sql(
         task,
-        ExplorerSqlInput(path="facts.db", sql="SELECT id, value FROM facts", limit=2),
+        _sql_input("facts.db", "SELECT id, value FROM facts", limit=2),
     )
     explained = tools.sql(
         task,
-        ExplorerSqlInput(
-            path="facts.db",
-            sql="EXPLAIN QUERY PLAN SELECT * FROM facts WHERE id = 1",
+        _sql_input(
+            "facts.db",
+            "EXPLAIN QUERY PLAN SELECT * FROM facts WHERE id = 1",
         ),
     )
     rejected = tools.sql(
         task,
-        ExplorerSqlInput(path="facts.db", sql="DELETE FROM facts"),
+        _sql_input("facts.db", "DELETE FROM facts"),
     )
     pragma = tools.sql(
         task,
-        ExplorerSqlInput(path="facts.db", sql="PRAGMA table_info(facts)"),
+        _sql_input("facts.db", "PRAGMA table_info(facts)"),
     )
     multi_statement = tools.sql(
         task,
-        ExplorerSqlInput(path="facts.db", sql="SELECT 1; SELECT 2"),
+        _sql_input("facts.db", "SELECT 1; SELECT 2"),
     )
     non_sqlite = tools.sql(
         task,
-        ExplorerSqlInput(path="sales.csv", sql="SELECT 1"),
+        _sql_input("sales.csv", "SELECT 1"),
     )
 
     assert selected.ok is True
@@ -437,7 +521,7 @@ def test_explorer_sql_output_is_character_bounded(tmp_path):
 
     result = tools.sql(
         task,
-        ExplorerSqlInput(path="large.db", sql="SELECT value FROM facts"),
+        _sql_input("large.db", "SELECT value FROM facts"),
     )
 
     assert result.ok is True
@@ -489,6 +573,67 @@ def test_report_ignores_unsupported_semantic_increments_without_losing_runtime_m
         )
 
 
+def test_runtime_projects_only_selected_deep_evidence_and_omits_automatic_relations(tmp_path):
+    task = _task(tmp_path)
+    (task.context_dir / "customers.csv").write_text(
+        "customer_id,name\nC1,Alice\nC2,Bob\n",
+        encoding="utf-8",
+    )
+    tools = _ExplorerTools(config=ExplorerConfig())
+    inspected = tools.inspect(task, InspectFilesInput())
+    previewed = tools.preview(task, _preview_input("sales.csv"))
+    grepped = tools.grep(task, _grep_input("C1"))
+    report = _report(sales_ref=previewed.content["evidence_id"])
+
+    result = tools.report(task, ExplorerReportInput.model_validate(report))
+
+    assert inspected.content["observation"]["relation_candidates"]
+    assert grepped.ok is True
+    assert result.ok is True
+    assembled = result.content["report"]
+    assert {item["path"] for item in assembled["files"]} == {
+        "customers.csv",
+        "sales.csv",
+    }
+    assert assembled["join_paths"] == []
+    assert [item["evidence_id"] for item in assembled["evidence_summaries"]] == [
+        previewed.content["evidence_id"]
+    ]
+    assert not any(key.startswith("grep:") for key in assembled["value_samples"])
+
+
+def test_relevant_evidence_must_match_its_discovery_requirement(tmp_path):
+    task = _task(tmp_path)
+    tools = _ExplorerTools(config=ExplorerConfig())
+    tools.inspect(task, InspectFilesInput())
+    previewed = tools.preview(task, _preview_input("sales.csv"))
+    report = _report()
+    report["task_requirements"].append(
+        {
+            "id": "filter_region",
+            "kind": "filter",
+            "description": "Locate the region filter.",
+        }
+    )
+    report["relevant_evidence"] = [
+        {
+            "evidence_id": previewed.content["evidence_id"],
+            "supports": ["filter_region"],
+        }
+    ]
+
+    result = tools.report(task, ExplorerReportInput.model_validate(report))
+
+    assert result.ok is True
+    assembled = result.content["report"]
+    assert assembled["relevant_evidence"] == []
+    assert assembled["evidence_summaries"] == []
+    assert any(
+        warning["message"].startswith("Ignored unsupported relevant evidence")
+        for warning in assembled["warnings"]
+    )
+
+
 def test_final_turn_free_retry_accepts_semantic_report(tmp_path):
     task = _task(tmp_path)
     events = []
@@ -496,7 +641,7 @@ def test_final_turn_free_retry_accepts_semantic_report(tmp_path):
         model=ScriptedModelAdapter(
             [
                 _single_response("inspect_files", {}, "inspect"),
-                _single_response("preview_file", {"path": "sales.csv"}, "late"),
+                _single_response("preview_file", _targeted({"path": "sales.csv"}), "late"),
                 _single_response("report", _report(), "retry_report"),
             ]
         ),
@@ -518,7 +663,7 @@ def test_final_retries_and_model_failure_use_deterministic_fallback(tmp_path):
         model=ScriptedModelAdapter(
             [
                 _single_response("inspect_files", {}, "inspect"),
-                _single_response("preview_file", {"path": "sales.csv"}, "late"),
+                _single_response("preview_file", _targeted({"path": "sales.csv"}), "late"),
             ]
         ),
         config=ExplorerConfig(max_steps=2),
@@ -563,15 +708,19 @@ def test_fallback_absorbs_successful_preview_grep_and_sql_observations(tmp_path)
         [
             _single_response("inspect_files", {}, "inspect"),
             _response(
-                _call("preview_file", {"path": "sales.csv"}, "preview"),
-                _call("grep_context", {"pattern": "C1"}, "grep"),
+                _call("preview_file", _targeted({"path": "sales.csv"}), "preview"),
+                _call("grep_context", _targeted({"pattern": "C1"}), "grep"),
             ),
             _single_response(
                 "execute_context_sql",
                 {
-                    "path": "facts.db",
-                    "sql": "SELECT id, label FROM facts",
-                    "limit": 2,
+                    **_targeted(
+                        {
+                            "path": "facts.db",
+                            "sql": "SELECT id, label FROM facts",
+                            "limit": 2,
+                        }
+                    ),
                 },
                 "sql",
             ),
@@ -597,16 +746,50 @@ def test_fallback_absorbs_successful_preview_grep_and_sql_observations(tmp_path)
     )
 
 
+def test_fallback_relevance_projection_is_limited_to_eight_deep_observations(tmp_path):
+    task = _task(tmp_path)
+    tools = _ExplorerTools(config=ExplorerConfig())
+    tools.inspect(task, InspectFilesInput())
+    for index in range(10):
+        tools.grep(
+            task,
+            _grep_input(
+                "C1",
+                requirement_id=f"filter_{index}",
+            ),
+        )
+
+    report, _ = tools.fallback("No valid report.")
+
+    assert len(report["relevant_evidence"]) == 8
+    assert len(report["evidence_summaries"]) == 8
+    assert {item["evidence_id"] for item in report["relevant_evidence"]} == {
+        f"grep:{index}" for index in range(3, 11)
+    }
+    assert any(
+        warning["message"].startswith("Fallback relevance projection omitted")
+        for warning in report["warnings"]
+    )
+
+
 def test_budget_warnings_and_final_retry_are_observable(tmp_path):
     task = _task(tmp_path)
     responses = [_single_response("inspect_files", {}, "inspect")]
     responses.extend(
-        _single_response("grep_context", {"pattern": "amount"}, f"grep-{index}")
+        _single_response(
+            "grep_context",
+            _targeted({"pattern": "amount"}),
+            f"grep-{index}",
+        )
         for index in range(2, 10)
     )
     responses.extend(
         [
-            _single_response("grep_context", {"pattern": "amount"}, "blocked-final"),
+            _single_response(
+                "grep_context",
+                _targeted({"pattern": "amount"}),
+                "blocked-final",
+            ),
             _single_response("report", _report(), "retry-report"),
         ]
     )

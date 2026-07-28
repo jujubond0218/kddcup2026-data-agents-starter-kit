@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from time import monotonic
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from data_agent_baseline.agents.model import (
     ModelAdapter,
@@ -49,7 +50,32 @@ class InspectFilesInput(_EmptyInput):
     pass
 
 
-class PreviewFileInput(_StrictInput):
+class _TargetedDiscoveryInput(_StrictInput):
+    requirement_ids: list[str] = Field(
+        min_length=1,
+        max_length=4,
+        description=(
+            "Stable task requirement IDs supported by this discovery call, such as "
+            "filter_region or measure_revenue."
+        ),
+    )
+    purpose: str = Field(
+        min_length=1,
+        max_length=300,
+        description="Why this call is necessary for the task question.",
+    )
+
+    @field_validator("requirement_ids")
+    @classmethod
+    def _validate_requirement_ids(cls, values: list[str]) -> list[str]:
+        if len(values) != len(set(values)):
+            raise ValueError("requirement_ids must be unique.")
+        if any(re.fullmatch(r"[a-z][a-z0-9_]{0,63}", value) is None for value in values):
+            raise ValueError("requirement_ids must be lowercase identifiers such as filter_region.")
+        return values
+
+
+class PreviewFileInput(_TargetedDiscoveryInput):
     path: str = Field(
         min_length=1,
         max_length=500,
@@ -57,7 +83,7 @@ class PreviewFileInput(_StrictInput):
     )
 
 
-class GrepContextInput(_StrictInput):
+class GrepContextInput(_TargetedDiscoveryInput):
     pattern: str = Field(
         min_length=1,
         max_length=200,
@@ -71,7 +97,7 @@ class GrepContextInput(_StrictInput):
     )
 
 
-class ExplorerSqlInput(_StrictInput):
+class ExplorerSqlInput(_TargetedDiscoveryInput):
     path: str = Field(
         min_length=1,
         max_length=500,
@@ -138,7 +164,29 @@ class EvidenceWarning(_StrictInput):
     evidence_refs: list[str] = Field(min_length=1, max_length=8)
 
 
+class TaskRequirement(_StrictInput):
+    id: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    kind: Literal[
+        "entity",
+        "measure",
+        "filter",
+        "time_scope",
+        "output",
+        "knowledge",
+        "join",
+        "other",
+    ]
+    description: str = Field(min_length=1, max_length=300)
+
+
+class RelevantEvidence(_StrictInput):
+    evidence_id: str = Field(min_length=1, max_length=100)
+    supports: list[str] = Field(min_length=1, max_length=4)
+
+
 class ExplorerReportInput(_StrictInput):
+    task_requirements: list[TaskRequirement] = Field(default_factory=list, max_length=12)
+    relevant_evidence: list[RelevantEvidence] = Field(default_factory=list, max_length=24)
     selected_sources: list[str] = Field(default_factory=list, max_length=16)
     field_semantics: list[FieldSemantic] = Field(default_factory=list, max_length=32)
     knowledge: list[KnowledgeEntry] = Field(default_factory=list, max_length=24)
@@ -190,21 +238,27 @@ data landscape and never calculate the final answer.
 
 Workflow:
 1. Your first successful turn must call inspect_files({}) and no other tool.
-2. If inspect_files lists knowledge.md (case-insensitive), you must call
+2. After inspect_files, decompose the question into stable lowercase requirement
+   IDs for entities, measures, filters, time scope, output fields, knowledge, or
+   joins. Every preview_file, grep_context, and execute_context_sql call must state
+   the requirement_ids it supports and a concise purpose.
+3. If inspect_files lists knowledge.md (case-insensitive), you must call
    preview_file for every listed knowledge.md before report.
-3. Use at most two independent tools in one turn. Targeted preview_file,
+4. Use at most two independent tools in one turn. Targeted preview_file,
    grep_context, and read-only execute_context_sql calls may share a turn.
-4. Turn 3 and later should call report unless a required rule, source, table, or
+5. Turn 3 and later should call report unless a required rule, source, table, or
    field is still unknown. Once every required field is located, stop exploring.
    Do not cross-check the same field in extra sources.
-5. report must be the only tool call in its turn and is the only normal way to
+6. report must be the only tool call in its turn and is the only normal way to
    finish. An incomplete semantic report is better than no report.
 
-The runtime already owns files, schemas, samples, warnings, and evidence
-provenance. Do not copy them into report. Submit only semantic increments:
-selected_sources, field_semantics, knowledge rules, advisory etl_candidates,
-candidate join_paths, objective warnings, and uncertainties. Every semantic
-claim must cite immutable evidence IDs returned by tools.
+The runtime always preserves a compact background inventory, but it includes deep
+preview/grep/SQL observations only when report.relevant_evidence selects them and
+binds them to declared task_requirements. Do not select evidence merely because
+it was collected. Submit task_requirements, relevant_evidence, selected_sources,
+field_semantics, knowledge rules, advisory etl_candidates, candidate join_paths,
+objective warnings, and uncertainties. Every semantic claim must cite selected
+immutable evidence IDs returned by tools.
 Observed data wins on conflict. Do not execute Python, write SQL, create indexes,
 perform ETL, give computation advice, or inspect anything outside context/.
 """.strip()
@@ -267,6 +321,9 @@ class _ExplorerTools:
         source_tool: str,
         observation: dict[str, Any],
         path: str | None = None,
+        requirement_ids: list[str] | None = None,
+        purpose: str | None = None,
+        ok: bool = True,
     ) -> dict[str, Any]:
         evidence_id = f"{prefix}:{sum(key.startswith(f'{prefix}:') for key in self.evidence) + 1}"
         evidence = {
@@ -274,6 +331,9 @@ class _ExplorerTools:
             "source_tool": source_tool,
             "path": path,
             "observation": observation,
+            "requirement_ids": list(requirement_ids or []),
+            "purpose": purpose,
+            "ok": ok,
         }
         self.evidence[evidence_id] = evidence
         return evidence
@@ -364,6 +424,9 @@ class _ExplorerTools:
                 prefix="preview",
                 source_tool="preview_file",
                 path=arguments.path,
+                requirement_ids=arguments.requirement_ids,
+                purpose=arguments.purpose,
+                ok=False,
                 observation={
                     "path": arguments.path,
                     "warnings": [
@@ -391,6 +454,8 @@ class _ExplorerTools:
             prefix="preview",
             source_tool="preview_file",
             path=arguments.path,
+            requirement_ids=arguments.requirement_ids,
+            purpose=arguments.purpose,
             observation=preview,
         )
         if is_knowledge:
@@ -433,6 +498,9 @@ class _ExplorerTools:
         evidence = self._add_evidence(
             prefix="grep",
             source_tool="grep_context",
+            path=arguments.path,
+            requirement_ids=arguments.requirement_ids,
+            purpose=arguments.purpose,
             observation=observation,
         )
         return ToolExecutionResult(ok=True, content=evidence)
@@ -465,6 +533,8 @@ class _ExplorerTools:
             prefix="sql",
             source_tool="execute_context_sql",
             path=arguments.path,
+            requirement_ids=arguments.requirement_ids,
+            purpose=arguments.purpose,
             observation=observation,
         )
         return ToolExecutionResult(ok=True, content=evidence)
@@ -488,6 +558,7 @@ class _ExplorerTools:
         columns: list[str],
         evidence_id: str,
         row_count: int | None = None,
+        max_columns: int = 64,
     ) -> dict[str, Any]:
         entry = schema_map.setdefault(
             self._schema_key(path, table),
@@ -499,7 +570,7 @@ class _ExplorerTools:
                 "evidence_refs": [],
             },
         )
-        for column in columns[:64]:
+        for column in columns[:max_columns]:
             if column not in entry["columns"]:
                 entry["columns"].append(column)
         if isinstance(row_count, int) and row_count >= 0:
@@ -583,9 +654,13 @@ class _ExplorerTools:
             "observation": content,
         }
 
-    def _known_fields(self) -> dict[str, set[tuple[str | None, str]]]:
+    def _known_fields(
+        self,
+        *,
+        selected_evidence_ids: set[str] | None = None,
+    ) -> dict[str, set[tuple[str | None, str]]]:
         known: dict[str, set[tuple[str | None, str]]] = {}
-        for evidence in self.evidence.values():
+        for evidence_id, evidence in self.evidence.items():
             observation = evidence.get("observation")
             if not isinstance(observation, dict):
                 continue
@@ -596,7 +671,7 @@ class _ExplorerTools:
                     summary = item.get("summary")
                     if isinstance(summary, dict):
                         known.setdefault(item["path"], set()).update(_summary_fields(summary))
-            else:
+            elif selected_evidence_ids is None or evidence_id in selected_evidence_ids:
                 path = evidence.get("path")
                 summary = observation.get("summary")
                 if isinstance(path, str) and isinstance(summary, dict):
@@ -607,10 +682,12 @@ class _ExplorerTools:
                     )
         return known
 
-    def _runtime_report(self) -> dict[str, Any]:
+    def _runtime_report(self, *, selected_evidence_ids: set[str]) -> dict[str, Any]:
         report: dict[str, Any] = {
             "files": [],
             "schema_map": {},
+            "task_requirements": [],
+            "relevant_evidence": [],
             "selected_sources": [],
             "knowledge": [],
             "etl_candidates": [],
@@ -664,6 +741,7 @@ class _ExplorerTools:
                                     if isinstance(column, dict) and column.get("name") is not None
                                 ],
                                 evidence_id=evidence_id,
+                                max_columns=16,
                                 row_count=(
                                     table.get("row_count")
                                     if isinstance(table.get("row_count"), int)
@@ -679,23 +757,13 @@ class _ExplorerTools:
                                 table=None,
                                 columns=columns,
                                 evidence_id=evidence_id,
+                                max_columns=16,
                                 row_count=(
                                     summary.get("row_count")
                                     if isinstance(summary.get("row_count"), int)
                                     else None
                                 ),
                             )
-                for candidate in observation.get("relation_candidates", []):
-                    if isinstance(candidate, dict):
-                        report["join_paths"].append(
-                            {
-                                "status": "candidate",
-                                "left": candidate.get("left"),
-                                "right": candidate.get("right"),
-                                "signals": candidate.get("signals", {}),
-                                "evidence_refs": [evidence_id],
-                            }
-                        )
                 for item in observation.get("warnings", []):
                     if isinstance(item, dict):
                         report["warnings"].append(
@@ -707,6 +775,8 @@ class _ExplorerTools:
                         )
                 continue
 
+            if evidence_id not in selected_evidence_ids:
+                continue
             if isinstance(path, str) and path in files_by_path:
                 self._append_ref(files_by_path[path], evidence_id)
             summary_entry = self._observation_summary(evidence)
@@ -820,15 +890,63 @@ class _ExplorerTools:
                     }
         return report
 
+    def _validated_relevance(
+        self,
+        arguments: ExplorerReportInput,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], set[str], list[dict[str, Any]]]:
+        requirements: list[dict[str, Any]] = []
+        requirement_ids: set[str] = set()
+        warnings: list[dict[str, Any]] = []
+        for requirement in arguments.task_requirements:
+            if requirement.id in requirement_ids:
+                warnings.append(
+                    self._warning(f"Ignored duplicate task requirement: {requirement.id}")
+                )
+                continue
+            requirement_ids.add(requirement.id)
+            requirements.append(requirement.model_dump(mode="json"))
+
+        relevant_evidence: list[dict[str, Any]] = []
+        selected_evidence_ids: set[str] = set()
+        for selection in arguments.relevant_evidence:
+            evidence = self.evidence.get(selection.evidence_id)
+            supports = set(selection.supports)
+            bound_requirements = (
+                set(evidence.get("requirement_ids", [])) if evidence is not None else set()
+            )
+            if (
+                evidence is None
+                or evidence.get("source_tool") == "inspect_files"
+                or evidence.get("ok") is False
+                or not supports.issubset(requirement_ids)
+                or not supports.issubset(bound_requirements)
+            ):
+                warnings.append(
+                    self._warning(f"Ignored unsupported relevant evidence: {selection.evidence_id}")
+                )
+                continue
+            selected_evidence_ids.add(selection.evidence_id)
+            relevant_evidence.append(
+                {
+                    **selection.model_dump(mode="json"),
+                    "source_tool": evidence["source_tool"],
+                    "path": evidence.get("path"),
+                    "purpose": evidence.get("purpose"),
+                }
+            )
+        return requirements, relevant_evidence, selected_evidence_ids, warnings
+
     def _apply_semantic_increments(
         self,
         report: dict[str, Any],
         arguments: ExplorerReportInput,
+        *,
+        selected_evidence_ids: set[str],
     ) -> None:
-        known_fields = self._known_fields()
+        known_fields = self._known_fields(selected_evidence_ids=selected_evidence_ids)
 
         def refs_are_valid(refs: list[str]) -> bool:
-            return bool(refs) and set(refs).issubset(self.evidence)
+            return bool(refs) and set(refs).issubset(selected_evidence_ids)
 
         for path in arguments.selected_sources:
             if path in self.discovered_paths and path not in report["selected_sources"]:
@@ -956,9 +1074,56 @@ class _ExplorerTools:
         *,
         fallback_reason: str | None = None,
     ) -> dict[str, Any]:
-        report = self._runtime_report()
+        relevance_warnings: list[dict[str, Any]] = []
+        if arguments is None:
+            (
+                requirements,
+                relevant_evidence,
+                selected_evidence_ids,
+                relevance_warnings,
+            ) = self._fallback_relevance()
+        else:
+            (
+                requirements,
+                relevant_evidence,
+                selected_evidence_ids,
+                relevance_warnings,
+            ) = self._validated_relevance(arguments)
+        report = self._runtime_report(selected_evidence_ids=selected_evidence_ids)
+        report["task_requirements"] = requirements
+        report["relevant_evidence"] = relevant_evidence
+        report["warnings"].extend(relevance_warnings)
+
+        selected_paths = {
+            str(self.evidence[evidence_id]["path"])
+            for evidence_id in selected_evidence_ids
+            if isinstance(self.evidence[evidence_id].get("path"), str)
+            and self.evidence[evidence_id]["path"] in self.discovered_paths
+        }
+        for evidence_id in selected_evidence_ids:
+            evidence = self.evidence[evidence_id]
+            if evidence.get("source_tool") != "grep_context":
+                continue
+            observation = evidence.get("observation")
+            if not isinstance(observation, dict):
+                continue
+            for match in observation.get("matches", []):
+                if (
+                    isinstance(match, dict)
+                    and isinstance(match.get("path"), str)
+                    and match["path"] in self.discovered_paths
+                ):
+                    selected_paths.add(match["path"])
         if arguments is not None:
-            self._apply_semantic_increments(report, arguments)
+            self._apply_semantic_increments(
+                report,
+                arguments,
+                selected_evidence_ids=selected_evidence_ids,
+            )
+            selected_paths.update(
+                path for path in arguments.selected_sources if path in self.discovered_paths
+            )
+        report["selected_sources"] = sorted(selected_paths)
         if fallback_reason is not None:
             first_ref = next(iter(self.evidence), None)
             report["warnings"].append(
@@ -969,6 +1134,72 @@ class _ExplorerTools:
             )
         self._bound_assembled_report(report)
         return report
+
+    def _fallback_relevance(
+        self,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], set[str], list[dict[str, Any]]]:
+        candidates = [
+            evidence
+            for evidence in self.evidence.values()
+            if evidence.get("source_tool") != "inspect_files"
+            and evidence.get("ok") is not False
+            and evidence.get("requirement_ids")
+        ]
+        prioritized: list[dict[str, Any]] = []
+        for evidence in candidates:
+            if evidence.get("path") in self.knowledge_paths:
+                prioritized.append(evidence)
+
+        seen_pairs: set[tuple[str, str]] = set()
+        for evidence in reversed(candidates):
+            tool = str(evidence.get("source_tool"))
+            adds_pair = False
+            for requirement_id in evidence.get("requirement_ids", []):
+                pair = (str(requirement_id), tool)
+                if pair not in seen_pairs:
+                    seen_pairs.add(pair)
+                    adds_pair = True
+            if adds_pair and evidence not in prioritized:
+                prioritized.append(evidence)
+        for evidence in reversed(candidates):
+            if evidence not in prioritized:
+                prioritized.append(evidence)
+
+        selected = prioritized[:8]
+        selected_ids = {str(evidence["evidence_id"]) for evidence in selected}
+        descriptions: dict[str, str] = {}
+        for evidence in selected:
+            purpose = str(evidence.get("purpose") or "Required by a targeted discovery call.")
+            for requirement_id in evidence.get("requirement_ids", []):
+                descriptions.setdefault(str(requirement_id), purpose)
+        requirements = [
+            {
+                "id": requirement_id,
+                "kind": "other",
+                "description": description,
+            }
+            for requirement_id, description in descriptions.items()
+        ]
+        relevant_evidence = [
+            {
+                "evidence_id": evidence["evidence_id"],
+                "supports": [
+                    str(requirement_id) for requirement_id in evidence.get("requirement_ids", [])
+                ],
+                "source_tool": evidence["source_tool"],
+                "path": evidence.get("path"),
+                "purpose": evidence.get("purpose"),
+            }
+            for evidence in selected
+        ]
+        warnings = []
+        if len(candidates) > len(selected):
+            warnings.append(
+                self._warning(
+                    "Fallback relevance projection omitted lower-priority deep observations."
+                )
+            )
+        return requirements, relevant_evidence, selected_ids, warnings
 
     def report(self, _: PublicTask, arguments: ExplorerReportInput) -> ToolExecutionResult:
         if error := self._require_inspection():
@@ -1011,7 +1242,8 @@ class _ExplorerTools:
                 name="execute_context_sql",
                 description=(
                     "Run bounded read-only SELECT, WITH, PRAGMA, or EXPLAIN SQL against an "
-                    "inspected SQLite file. Never compute the final answer."
+                    "inspected SQLite file. State stable requirement_ids and why this query "
+                    "is necessary. Never compute the final answer."
                 ),
                 input_model=ExplorerSqlInput,
                 handler=self.sql,
@@ -1020,7 +1252,8 @@ class _ExplorerTools:
                 name="grep_context",
                 description=(
                     "Search a bounded case-insensitive regex across inspected Phase 1 text "
-                    "and SQLite sources. Use only to locate evidence, not aggregate data."
+                    "and SQLite sources. State stable requirement_ids and why this search is "
+                    "necessary. Use only to locate evidence, not aggregate data."
                 ),
                 input_model=GrepContextInput,
                 handler=self.grep,
@@ -1038,7 +1271,8 @@ class _ExplorerTools:
                 name="preview_file",
                 description=(
                     "Preview one path returned by inspect_files and receive immutable "
-                    "evidence. Every knowledge.md must be previewed before report."
+                    "evidence. State stable requirement_ids and why the preview is necessary. "
+                    "Every knowledge.md must be previewed before report."
                 ),
                 input_model=PreviewFileInput,
                 handler=self.preview,
@@ -1046,9 +1280,10 @@ class _ExplorerTools:
             "report": ToolSpec(
                 name="report",
                 description=(
-                    "Submit only semantic increments and finish. The runtime automatically "
-                    "merges files, schemas, samples, warnings, and evidence provenance. "
-                    "Must be the only call in its turn."
+                    "Submit task_requirements and select only question-relevant deep "
+                    "observations through relevant_evidence, plus supported semantic "
+                    "increments. The runtime preserves a compact background inventory and "
+                    "projects only selected preview/grep/SQL evidence. Must be the only call."
                 ),
                 input_model=ExplorerReportInput,
                 handler=self.report,
@@ -1093,15 +1328,33 @@ class ExplorerRunner:
         reason_code: str,
     ) -> ExplorerResult:
         report, evidence = tools.fallback(reason)
+        report_chars = len(
+            json.dumps(report, ensure_ascii=False, separators=(",", ":"), default=str)
+        )
+        relevance_metrics = {
+            "task_requirement_count": len(report.get("task_requirements", [])),
+            "relevant_evidence_count": len(report.get("relevant_evidence", [])),
+            "selected_source_count": len(report.get("selected_sources", [])),
+            "report_chars": report_chars,
+        }
         emit_event(
             self.event_sink,
             "explorer_fallback_used",
-            {"steps_used": steps_used, "reason_code": reason_code},
+            {
+                "steps_used": steps_used,
+                "reason_code": reason_code,
+                **relevance_metrics,
+            },
         )
         emit_event(
             self.event_sink,
             "explorer_completed",
-            {"steps_used": steps_used, "fallback_used": True, "success": bool(evidence)},
+            {
+                "steps_used": steps_used,
+                "fallback_used": True,
+                "success": bool(evidence),
+                **relevance_metrics,
+            },
         )
         return ExplorerResult(
             success=bool(evidence),
@@ -1195,8 +1448,9 @@ class ExplorerRunner:
                 content=(
                     f"FINAL REPORT RETRY {retry_index}/{self._MAX_FINAL_REPORT_RETRIES}: "
                     f"the prior final attempt failed with {error_code}. Call report as the "
-                    "only tool now. Submit only supported semantic increments; empty lists "
-                    "are valid because the runtime assembles all deterministic evidence."
+                    "only tool now. Declare task_requirements and select only evidence whose "
+                    "recorded requirement_ids support them. Empty semantic lists are valid "
+                    "because the runtime preserves the compact background inventory."
                 ),
             )
         )
@@ -1391,6 +1645,7 @@ class ExplorerRunner:
                         final_error_code = result.error_code or "FINAL_REPORT_REJECTED"
 
                 if terminal_result is not None:
+                    report = terminal_result.content["report"]
                     emit_event(
                         self.event_sink,
                         "explorer_completed",
@@ -1398,11 +1653,22 @@ class ExplorerRunner:
                             "steps_used": step_index,
                             "fallback_used": False,
                             "final_report_retries": final_retry_index,
+                            "task_requirement_count": len(report.get("task_requirements", [])),
+                            "relevant_evidence_count": len(report.get("relevant_evidence", [])),
+                            "selected_source_count": len(report.get("selected_sources", [])),
+                            "report_chars": len(
+                                json.dumps(
+                                    report,
+                                    ensure_ascii=False,
+                                    separators=(",", ":"),
+                                    default=str,
+                                )
+                            ),
                         },
                     )
                     return ExplorerResult(
                         success=True,
-                        report=terminal_result.content["report"],
+                        report=report,
                         evidence=terminal_result.content["evidence"],
                         steps_used=step_index,
                     )
