@@ -218,10 +218,13 @@ The locked plan is immutable. Every deep call must bind to real candidate paths 
 at most three calls per requirement. The runtime normalizes ambiguous-field discovery flags and
 adds omitted knowledge-review requirements. After knowledge review is attempted, `report` is
 available for an early unresolved result; once all required or ambiguous fields have evidence,
-only `report` remains available. The runtime still issues 70% and 90% convergence reminders and
-allows up to two free corrective final retries. The model submits only relevant evidence,
+only `report` remains available, and Turn 6 after locking is also a report-only deadline. The
+runtime issues 70% and 90% reminders against this normal six-turn budget and allows up to two
+free corrective final retries. The model submits only relevant evidence,
 requirement resolutions, and other semantic increments; the runtime merges the file list,
-schemas, locked requirements, and evidence provenance. If no valid report is produced, fallback
+schemas, locked requirements, and evidence provenance. Malformed semantic items are ignored
+individually, while overlong submissions are bounded instead of rejected wholesale. If no valid
+report is produced, fallback
 reuses the locked plan and selects at most eight higher-priority evidence items.
 
 ## Outputs

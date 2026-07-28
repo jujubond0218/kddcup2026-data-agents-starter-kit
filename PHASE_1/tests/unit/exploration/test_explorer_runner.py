@@ -827,6 +827,25 @@ def test_report_ignores_unsupported_semantic_increments_without_losing_runtime_m
         )
 
 
+def test_report_input_keeps_valid_semantic_items_and_drops_malformed_ones():
+    report = ExplorerReportInput.model_validate(
+        {
+            "relevant_evidence": [
+                {"evidence_id": "preview:1", "supports": ["source_data"]},
+                {"unexpected": "shape"},
+            ],
+            "selected_sources": [123, "sales.csv"],
+            "field_semantics": [{"path": "sales.csv"}],
+            "unexpected_top_level": True,
+        }
+    )
+
+    assert len(report.relevant_evidence) == 1
+    assert report.relevant_evidence[0].evidence_id == "preview:1"
+    assert report.selected_sources == ["sales.csv"]
+    assert report.field_semantics == []
+
+
 def test_runtime_projects_only_selected_deep_evidence_and_omits_automatic_relations(tmp_path):
     task = _task(tmp_path)
     (task.context_dir / "customers.csv").write_text(
@@ -908,6 +927,52 @@ def test_final_turn_free_retry_accepts_semantic_report(tmp_path):
     retry = next(payload for kind, payload in events if kind == "explorer_final_report_retry")
     assert retry["retry_index"] == 1
     assert retry["error_code"] == "FINAL_REPORT_REQUIRED"
+
+
+def test_sixth_turn_forces_report_even_when_ambiguity_is_not_fully_covered(tmp_path):
+    task = _task(tmp_path)
+    (task.context_dir / "other.csv").write_text("region\nNorth\n", encoding="utf-8")
+    candidates = [
+        {"path": "sales.csv", "table": None, "field": "amount"},
+        {"path": "other.csv", "table": None, "field": "region"},
+    ]
+    lock_payload = {
+        "requirements": [
+            {
+                "id": "ambiguous_measure",
+                "kind": "measure",
+                "description": "Resolve the requested measure.",
+                "candidate_paths": ["sales.csv", "other.csv"],
+                "candidate_fields": candidates,
+                "search_terms": ["sales"],
+                "needs_discovery": True,
+            }
+        ]
+    }
+    discovery = _targeted(
+        {"pattern": "10", "path": "sales.csv"},
+        requirement_id="ambiguous_measure",
+        target_fields=[candidates[0]],
+    )
+    model = ScriptedModelAdapter(
+        [
+            _single_response("inspect_files", {}, "inspect"),
+            _single_response("lock_requirements", lock_payload, "lock"),
+            _single_response("grep_context", discovery, "grep_1"),
+            _single_response("grep_context", discovery, "grep_2"),
+            _single_response("grep_context", discovery, "grep_3"),
+            _single_response("report", _report(), "report"),
+        ]
+    )
+
+    result = ExplorerRunner(
+        model=model,
+        config=ExplorerConfig(max_steps=10),
+    ).run(task, ExploreInput())
+
+    assert result.success is True
+    assert result.steps_used == 6
+    assert model.requested_tool_names[5] == ("report",)
 
 
 def test_final_retries_and_model_failure_use_deterministic_fallback(tmp_path):
@@ -1052,7 +1117,7 @@ def test_fallback_relevance_projection_is_limited_to_eight_deep_observations(tmp
 
 def test_budget_warnings_and_final_retry_are_observable(tmp_path):
     task = _task(tmp_path)
-    requirement_ids = tuple(f"filter_{index}" for index in range(8))
+    requirement_ids = tuple(f"filter_{index}" for index in range(4))
     responses = [
         _single_response("inspect_files", {}, "inspect"),
         _single_response(
@@ -1070,7 +1135,7 @@ def test_budget_warnings_and_final_retry_are_observable(tmp_path):
             ),
             f"grep-{index}",
         )
-        for index in range(7)
+        for index in range(3)
     )
     responses.extend(
         [
@@ -1078,7 +1143,7 @@ def test_budget_warnings_and_final_retry_are_observable(tmp_path):
                 "grep_context",
                 _targeted(
                     {"pattern": "amount", "path": "sales.csv"},
-                    requirement_id="filter_7",
+                    requirement_id="filter_3",
                 ),
                 "blocked-final",
             ),
@@ -1095,7 +1160,7 @@ def test_budget_warnings_and_final_retry_are_observable(tmp_path):
     ).run(task, ExploreInput())
 
     assert result.success is True
-    assert result.steps_used == 10
+    assert result.steps_used == 6
     levels = [payload["level"] for kind, payload in events if kind == "explorer_budget_warning"]
     assert levels == ["warning", "critical"]
     assert model.requested_tool_names[-2:] == [("report",), ("report",)]

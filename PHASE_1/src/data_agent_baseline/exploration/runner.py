@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from time import monotonic
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from data_agent_baseline.agents.model import (
     ModelAdapter,
@@ -239,7 +239,9 @@ class RequirementResolution(_StrictInput):
     note: str | None = Field(default=None, max_length=300)
 
 
-class ExplorerReportInput(_StrictInput):
+class ExplorerReportInput(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     relevant_evidence: list[RelevantEvidence] = Field(default_factory=list, max_length=24)
     requirement_resolutions: list[RequirementResolution] = Field(
         default_factory=list, max_length=12
@@ -251,6 +253,52 @@ class ExplorerReportInput(_StrictInput):
     join_paths: list[JoinPath] = Field(default_factory=list, max_length=12)
     warnings: list[EvidenceWarning] = Field(default_factory=list, max_length=12)
     uncertainties: list[EvidenceWarning] = Field(default_factory=list, max_length=12)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _keep_valid_semantic_increments(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return {}
+        item_models: dict[str, type[BaseModel]] = {
+            "relevant_evidence": RelevantEvidence,
+            "requirement_resolutions": RequirementResolution,
+            "field_semantics": FieldSemantic,
+            "knowledge": KnowledgeEntry,
+            "etl_candidates": EtlCandidate,
+            "join_paths": JoinPath,
+            "warnings": EvidenceWarning,
+            "uncertainties": EvidenceWarning,
+        }
+        item_limits = {
+            "relevant_evidence": 24,
+            "requirement_resolutions": 12,
+            "field_semantics": 32,
+            "knowledge": 24,
+            "etl_candidates": 8,
+            "join_paths": 12,
+            "warnings": 12,
+            "uncertainties": 12,
+        }
+        normalized: dict[str, Any] = {}
+        for field_name, item_model in item_models.items():
+            raw_items = value.get(field_name, [])
+            if not isinstance(raw_items, list):
+                normalized[field_name] = []
+                continue
+            valid_items = []
+            for item in raw_items:
+                try:
+                    valid_items.append(item_model.model_validate(item).model_dump(mode="json"))
+                except ValidationError:
+                    continue
+            normalized[field_name] = valid_items[: item_limits[field_name]]
+        selected_sources = value.get("selected_sources", [])
+        normalized["selected_sources"] = (
+            [item for item in selected_sources if isinstance(item, str)][:16]
+            if isinstance(selected_sources, list)
+            else []
+        )
+        return normalized
 
 
 @dataclass(frozen=True, slots=True)
@@ -1632,9 +1680,13 @@ class _ExplorerTools:
             separators=(",", ":"),
         )
         if len(rendered) > self.config.max_report_chars:
-            return _error_result(
-                "REPORT_TOO_LARGE",
-                f"Explorer semantic report exceeds {self.config.max_report_chars} characters.",
+            emit_event(
+                self.event_sink,
+                "explorer_report_budget_exceeded",
+                {
+                    "semantic_report_chars": len(rendered),
+                    "preferred_report_chars": self.config.max_report_chars,
+                },
             )
         return ToolExecutionResult(
             ok=True,
@@ -1738,6 +1790,7 @@ class _ExplorerTools:
 
 class ExplorerRunner:
     _MAX_FINAL_REPORT_RETRIES = 2
+    _REPORT_DUE_STEP = 6
 
     def __init__(
         self,
@@ -1817,7 +1870,8 @@ class ExplorerRunner:
         step_index: int,
         emitted_levels: set[str],
     ) -> None:
-        ratio = step_index / self.config.max_steps
+        expected_steps = min(self.config.max_steps, self._REPORT_DUE_STEP)
+        ratio = step_index / expected_steps
         level: str | None = None
         message: str | None = None
         if ratio >= 0.9:
@@ -1937,7 +1991,7 @@ class ExplorerRunner:
                 step_index=step_index,
                 emitted_levels=emitted_budget_levels,
             )
-            final_step = step_index == self.config.max_steps
+            hard_final_step = step_index == self.config.max_steps
             final_retry_index = 0
             while True:
                 if monotonic() - started_at >= self.config.max_duration_seconds:
@@ -1947,7 +2001,10 @@ class ExplorerRunner:
                         reason="Explorer exceeded its soft time budget.",
                         reason_code="SOFT_TIMEOUT",
                     )
-                registry = tools.registry(final_step=final_step)
+                report_due = hard_final_step or (
+                    tools.requirements_locked and step_index >= self._REPORT_DUE_STEP
+                )
+                registry = tools.registry(final_step=report_due)
                 try:
                     response = self.model.complete(
                         messages,
@@ -2013,7 +2070,7 @@ class ExplorerRunner:
                         "report must be the only tool call in its turn.",
                     )
                 elif (
-                    final_step
+                    report_due
                     and tools.requirements_locked
                     and (len(calls) != 1 or calls[0].name != "report")
                 ):
@@ -2041,7 +2098,7 @@ class ExplorerRunner:
                             "tool_call_count": len(calls),
                         },
                     )
-                    if final_step and final_retry_index < self._MAX_FINAL_REPORT_RETRIES:
+                    if report_due and final_retry_index < self._MAX_FINAL_REPORT_RETRIES:
                         final_retry_index += 1
                         self._request_final_report_retry(
                             messages=messages,
@@ -2050,7 +2107,7 @@ class ExplorerRunner:
                             error_code=code,
                         )
                         continue
-                    if final_step:
+                    if report_due:
                         return self._fallback_result(
                             tools=tools,
                             steps_used=step_index,
@@ -2099,7 +2156,7 @@ class ExplorerRunner:
                         )
                     if result.is_terminal and result.ok:
                         terminal_result = result
-                    elif final_step:
+                    elif report_due:
                         final_error_code = result.error_code or (
                             "FINAL_REPORT_REQUIRED"
                             if call.name != "report"
@@ -2145,7 +2202,7 @@ class ExplorerRunner:
                         evidence=terminal_result.content["evidence"],
                         steps_used=step_index,
                     )
-                if final_step:
+                if report_due:
                     if final_retry_index < self._MAX_FINAL_REPORT_RETRIES:
                         final_retry_index += 1
                         self._request_final_report_retry(
