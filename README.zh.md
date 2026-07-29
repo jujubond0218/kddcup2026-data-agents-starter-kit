@@ -78,6 +78,7 @@ uv.lock                           # 锁定的依赖版本
 - [2026-07-24：Phase 1 运行可靠性与实验反馈周期改造](PHASE_1/docs/2026-07-24-runner-reliability.md)
 - [2026-07-24：Phase 1 原生工具调用改造](PHASE_1/docs/2026-07-24-native-tool-calling.md)
 - [2026-07-24：Phase 1 确定性答案验证](PHASE_1/docs/2026-07-24-answer-verification.md)
+- [2026-07-27：Phase 1 受限 Context Explorer](PHASE_1/docs/2026-07-27-context-explorer.md)
 
 ## 联系方式
 

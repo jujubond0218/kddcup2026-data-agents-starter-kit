@@ -15,6 +15,11 @@ agent:
 run:
   max_workers: 3
   task_timeout_seconds: 45.5
+explorer:
+  enabled: true
+  max_steps: 10
+  max_duration_seconds: 55
+  max_preview_calls: 2
 """.strip(),
         encoding="utf-8",
     )
@@ -26,3 +31,14 @@ run:
     assert config.agent.model_retry_backoff_seconds == 0.5
     assert config.run.max_workers == 3
     assert config.run.task_timeout_seconds == 45.5
+    assert config.explorer.enabled is True
+    assert config.explorer.max_steps == 10
+    assert config.explorer.max_duration_seconds == 55
+    assert config.explorer.max_preview_calls == 2
+
+
+def test_can_disable_explorer(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("explorer:\n  enabled: false\n", encoding="utf-8")
+
+    assert load_app_config(config_path).explorer.enabled is False

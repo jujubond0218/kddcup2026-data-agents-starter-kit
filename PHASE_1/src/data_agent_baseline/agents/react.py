@@ -90,13 +90,35 @@ class ReActAgent:
         self.event_sink = event_sink
         self.answer_verifier = answer_verifier or AnswerVerifier()
 
+    def _exploration_required(self) -> bool:
+        return "explore" in self.tools.specs
+
+    def _active_tools(
+        self, *, exploration_pending: bool, exploration_required: bool
+    ) -> ToolRegistry:
+        if exploration_pending:
+            return ToolRegistry(specs={"explore": self.tools.specs["explore"]})
+        if exploration_required:
+            return ToolRegistry(
+                specs={name: spec for name, spec in self.tools.specs.items() if name != "explore"}
+            )
+        return self.tools
+
     def _initial_messages(self, task: PublicTask) -> list[ModelMessage]:
+        exploration_required = self._exploration_required()
         return [
             ModelMessage(
                 role="system",
-                content=build_system_prompt(system_prompt=self.system_prompt),
+                content=build_system_prompt(
+                    system_prompt=self.system_prompt,
+                    explore_available="explore" in self.tools.specs,
+                    explore_required=exploration_required,
+                ),
             ),
-            ModelMessage(role="user", content=build_task_prompt(task)),
+            ModelMessage(
+                role="user",
+                content=build_task_prompt(task),
+            ),
         ]
 
     def _record_protocol_error(
@@ -213,6 +235,8 @@ class ReActAgent:
     def run(self, task: PublicTask) -> AgentRunResult:
         state = AgentRuntimeState()
         messages = self._initial_messages(task)
+        exploration_required = self._exploration_required()
+        exploration_pending = exploration_required
 
         for step_index in range(1, self.config.max_steps + 1):
             emit_event(
@@ -220,9 +244,13 @@ class ReActAgent:
                 "step_started",
                 {"step_index": step_index},
             )
+            active_tools = self._active_tools(
+                exploration_pending=exploration_pending,
+                exploration_required=exploration_required,
+            )
             response = self.model.complete(
                 messages,
-                tools=self.tools,
+                tools=active_tools,
                 request_context={
                     "task_id": task.task_id,
                     "step_index": step_index,
@@ -276,7 +304,9 @@ class ReActAgent:
                     "arguments": call.arguments,
                 },
             )
-            tool_result = self.tools.execute(task, call)
+            tool_result = active_tools.execute(task, call)
+            if exploration_pending and call.name == "explore":
+                exploration_pending = False
             if tool_result.is_terminal:
                 tool_result = self._verify_terminal_answer(
                     call=call,

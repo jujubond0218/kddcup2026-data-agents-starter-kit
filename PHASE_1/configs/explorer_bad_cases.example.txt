@@ -1,0 +1,20 @@
+# Core Explorer regression cases
+task_38
+task_80
+task_86
+task_173
+task_199
+task_259
+
+# Secondary observation cases
+task_19
+task_25
+task_89
+
+# Non-Explorer controls (not part of the 9-task target run)
+# task_11
+# task_27
+# task_163
+# task_169
+# task_180
+# task_196

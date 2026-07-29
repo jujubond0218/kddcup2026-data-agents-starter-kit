@@ -88,7 +88,7 @@ agent:
   model: YOUR_MODEL_NAME
   api_base: YOUR_API_BASE_URL
   api_key: YOUR_API_KEY
-  max_steps: 16
+  max_steps: 20
   temperature: 0.0
   model_request_timeout_seconds: 20
   model_max_retries: 1
@@ -99,6 +99,16 @@ run:
   run_id:
   max_workers: 2
   task_timeout_seconds: 120
+
+explorer:
+  enabled: true
+  max_steps: 2
+  max_duration_seconds: 60
+  max_files: 64
+  max_preview_calls: 2
+  max_preview_chars: 2000
+  max_inventory_chars: 12000
+  max_report_chars: 4000
 ```
 
 Config fields:
@@ -118,6 +128,9 @@ Config fields:
 | `run.run_id` | Optional run directory name. Defaults to a UTC timestamp if omitted. Required by `--resume`. |
 | `run.max_workers` | Parallel worker count for `run-benchmark`. |
 | `run.task_timeout_seconds` | Maximum wall-clock time per task. Set to `0` or a negative value to disable the task-level timeout. |
+| `explorer.enabled` | Exposes one argument-free `explore({})` call on the main Agent's first turn. Deterministic Inventory and knowledge evidence are built inside the tool. |
+| `explorer.max_steps` | Explorer model-request ceiling. The default and effective hard limit are two: report immediately or request one targeted follow-up, then report only. Larger legacy values still parse but do not reopen an exploration loop. |
+| `explorer.max_duration_seconds` | Explorer soft wall-clock limit. On expiry, successful evidence is converted into a bounded fallback data map before the task-level hard timeout. |
 
 ## CLI
 
@@ -147,6 +160,14 @@ uv run dabench run-benchmark \
   --task-file configs/regression_tasks.example.txt
 ```
 
+Run the fixed nine-task Explorer bad-case selection:
+
+```bash
+uv run dabench run-benchmark \
+  --config configs/react_baseline.local.yaml \
+  --task-file configs/explorer_bad_cases.example.txt
+```
+
 Set `run.run_id` to the existing run directory name, then resume an interrupted run or
 retry only its completed failures:
 
@@ -164,9 +185,14 @@ uv run dabench run-benchmark \
 
 ## Tools
 
-Tools are advertised through the OpenAI-compatible native `tools` field. The model returns
+Tools are advertised through the OpenAI-compatible native `tools` field. The main Agent returns
 one `tool_call` per turn, the registry validates its JSON arguments with Pydantic before
 execution, and the result is returned as a `tool` message with the matching `tool_call_id`.
+The Explorer is the only scoped exception: the runtime first performs a deterministic bounded
+scan of every supported file and extracts source-anchored `knowledge.md` evidence. The child
+Agent then decomposes the task and submits its guide in one model request. Only when Inventory
+cannot resolve a critical source or field may it make one targeted follow-up; the second request
+exposes `report` only, and the follow-up receives its observation under the original call ID.
 An `answer` call must also pass deterministic CSV-safety verification before it can terminate
 the task; rejected candidates receive a recoverable tool observation for correction.
 The same Chat Completions flow works with Alibaba Cloud Model Studio's OpenAI-compatible
@@ -177,6 +203,7 @@ The baseline exposes these tools to the model:
 | Tool | Purpose | Inputs |
 | --- | --- | --- |
 | `list_context` | List files and directories under `context/`. | `max_depth` |
+| `explore` | Launch one Phase 1 reference-guide sub-agent. The runtime scans all supported files and extracts anchored knowledge evidence; the model decomposes the task and returns recommended sources/fields, candidate joins, and uncertainties. It may follow up once and is removed even on fail-open. | none (`{}`) |
 | `read_csv` | Read a CSV preview. | `path`, `max_rows` |
 | `read_json` | Read a JSON preview. | `path`, `max_chars` |
 | `read_doc` | Read a text document preview. | `path`, `max_chars` |
@@ -186,6 +213,19 @@ The baseline exposes these tools to the model:
 | `answer` | Submit the final answer table and terminate the task. | `columns`, `rows` |
 
 All file paths passed to tools must be relative to the task `context/` directory.
+`explore` no longer advertises `inspect_files` to the model. Deterministic Inventory is completed
+before the first Explorer request and covers CSV/TSV, JSON, SQLite, Markdown, text, and text-based
+PDF inputs. `knowledge.md` uses a separate budget to select the question-relevant section, which
+is preserved under `knowledge.source_evidence`. The first request produces
+`task_requirements`, `recommended_sources`, `knowledge.applicable_rules`, candidate
+`join_paths`, and `uncertainties`. If one follow-up is needed, tool schemas enumerate only real
+Inventory paths; SQL is absent without SQLite, and the second request exposes only `report`.
+The runtime merges the complete file list and schemas, validates path/field/evidence references,
+and ignores malformed semantic items individually. If follow-up arguments fail validation, the
+tool fails, or the result contains no material evidence, the runtime injects an unresolved
+requirement and uncertainty and downgrades a known target source to `candidate`. On model failure
+or timeout, fallback keeps Inventory, exact knowledge evidence, and explicit unresolved
+requirements instead of reopening an exploration loop.
 
 ## Outputs
 
@@ -238,6 +278,8 @@ results are recorded in
 [`docs/2026-07-24-native-tool-calling.md`](docs/2026-07-24-native-tool-calling.md).
 The deterministic pre-submit checks and correction flow are documented in
 [`docs/2026-07-24-answer-verification.md`](docs/2026-07-24-answer-verification.md).
+The bounded Explorer design, limits, fallback behavior, and evaluation boundaries are recorded in
+[`docs/2026-07-27-context-explorer.md`](docs/2026-07-27-context-explorer.md).
 
 ## Contact
 
@@ -294,6 +336,7 @@ The deterministic pre-submit checks and correction flow are documented in
 | `src/data_agent_baseline/tools/sqlite.py` | `inspect_sqlite_schema`, `execute_context_sql` |
 | `src/data_agent_baseline/tools/contracts.py` | Pydantic input contracts for native tools |
 | `src/data_agent_baseline/tools/registry.py` | JSON Schema generation, validation, dispatch, and terminal `answer` |
+| `src/data_agent_baseline/exploration/` | Bounded Explorer sub-agent and deterministic context inventory |
 | `src/data_agent_baseline/agents/model.py` | OpenAI-compatible messages and native `tool_calls` adapter |
 | `src/data_agent_baseline/agents/prompt.py` | System and task prompts |
 | `src/data_agent_baseline/agents/react.py` | Native tool-calling ReAct runtime |

@@ -198,3 +198,28 @@ def test_parses_and_replays_native_tool_messages():
     request_messages = client.completions.requests[0]["messages"]
     assert request_messages[0]["tool_calls"][0]["id"] == "call_previous"
     assert request_messages[1]["tool_call_id"] == "call_previous"
+
+
+def test_records_provider_usage_when_it_is_available():
+    raw_response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content="ok", tool_calls=None),
+                finish_reason="stop",
+            )
+        ],
+        usage=SimpleNamespace(prompt_tokens=11, completion_tokens=7, total_tokens=18),
+    )
+    events = []
+    adapter, _, _ = _adapter(
+        [raw_response],
+        event_sink=lambda event_type, payload: events.append((event_type, payload)),
+    )
+
+    response = adapter.complete([ModelMessage(role="user", content="hello")])
+
+    assert response.usage == {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
+    succeeded = next(
+        payload for event_type, payload in events if event_type == "model_request_succeeded"
+    )
+    assert succeeded["usage"] == response.usage

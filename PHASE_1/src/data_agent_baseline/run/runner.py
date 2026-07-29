@@ -6,7 +6,7 @@ import multiprocessing
 import shutil
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
@@ -17,6 +17,7 @@ from data_agent_baseline.agents.react import ReActAgent, ReActAgentConfig
 from data_agent_baseline.benchmark.dataset import DABenchPublicDataset
 from data_agent_baseline.config import AppConfig
 from data_agent_baseline.events import EventSink, JsonlEventRecorder, read_events
+from data_agent_baseline.exploration.runner import ExplorerConfig, create_explorer_tool_spec
 from data_agent_baseline.tools.registry import ToolRegistry, create_default_tool_registry
 
 
@@ -129,9 +130,21 @@ def _run_single_task_core(
     public_dataset = DABenchPublicDataset(config.dataset.root_path)
     task = public_dataset.get_task(task_id)
 
+    effective_model = model or build_model_adapter(config, event_sink=event_sink)
+    effective_tools = tools or create_default_tool_registry()
+    if tools is None and config.explorer.enabled:
+        explorer_config = ExplorerConfig(**asdict(config.explorer))
+        specs = dict(effective_tools.specs)
+        specs["explore"] = create_explorer_tool_spec(
+            model=effective_model,
+            config=explorer_config,
+            event_sink=event_sink,
+        )
+        effective_tools = ToolRegistry(specs=specs)
+
     agent = ReActAgent(
-        model=model or build_model_adapter(config, event_sink=event_sink),
-        tools=tools or create_default_tool_registry(),
+        model=effective_model,
+        tools=effective_tools,
         config=ReActAgentConfig(max_steps=config.agent.max_steps),
         event_sink=event_sink,
     )

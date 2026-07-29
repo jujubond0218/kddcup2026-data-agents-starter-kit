@@ -88,7 +88,7 @@ agent:
   model: YOUR_MODEL_NAME
   api_base: YOUR_API_BASE_URL
   api_key: YOUR_API_KEY
-  max_steps: 16
+  max_steps: 20
   temperature: 0.0
   model_request_timeout_seconds: 20
   model_max_retries: 1
@@ -99,6 +99,16 @@ run:
   run_id:
   max_workers: 2
   task_timeout_seconds: 120
+
+explorer:
+  enabled: true
+  max_steps: 2
+  max_duration_seconds: 60
+  max_files: 64
+  max_preview_calls: 2
+  max_preview_chars: 2000
+  max_inventory_chars: 12000
+  max_report_chars: 4000
 ```
 
 配置字段说明：
@@ -118,6 +128,9 @@ run:
 | `run.run_id` | 可选，指定运行目录名。不传时默认使用 UTC 时间戳；使用 `--resume` 时必须填写。 |
 | `run.max_workers` | `run-benchmark` 并行 worker 数。 |
 | `run.task_timeout_seconds` | 单个任务允许的最长墙钟时间。设为 `0` 或负数可关闭任务级超时。 |
+| `explorer.enabled` | 是否在主 Agent 首轮仅暴露一次无参数 `explore({})`；确定性 Inventory 与 knowledge 证据在工具内部生成。 |
+| `explorer.max_steps` | Explorer 模型请求上限，默认和有效硬上限均为 2；第一次直接报告或提出一次定向补查，第二次只允许报告。旧配置中的更大值仍可读取，但不会扩展自由探索轮数。 |
+| `explorer.max_duration_seconds` | Explorer 软墙钟上限；超限时先用已有证据生成有界 fallback，避免直接耗尽任务级硬超时。 |
 
 ## CLI
 
@@ -147,6 +160,14 @@ uv run dabench run-benchmark \
   --task-file configs/regression_tasks.example.txt
 ```
 
+运行固定的 9 题 Explorer bad-case 回归集：
+
+```bash
+uv run dabench run-benchmark \
+  --config configs/react_baseline.local.yaml \
+  --task-file configs/explorer_bad_cases.example.txt
+```
+
 先把 `run.run_id` 设置为已有运行目录名，再恢复中断运行或只重试已经完成的失败任务：
 
 ```bash
@@ -163,10 +184,14 @@ uv run dabench run-benchmark \
 
 ## Tools
 
-工具通过 OpenAI-compatible 原生 `tools` 字段提供给模型。模型每轮返回一个
+工具通过 OpenAI-compatible 原生 `tools` 字段提供给模型。主 Agent 每轮返回一个
 `tool_call`，注册表在执行前使用 Pydantic 校验 JSON 参数，结果再通过带有匹配
 `tool_call_id` 的 `tool` 消息返回。现有 `agent.api_base` 配置也可直接连接阿里云百炼
 OpenAI-compatible Chat Completions 接口。
+Explorer 是唯一的局部例外：运行时先确定性、有界地扫描全部支持文件并提取带来源锚点的
+`knowledge.md` 相关章节，再让子 Agent 在一次模型请求中拆解任务并提交说明书；只有
+Inventory 无法判断关键来源或字段时，才允许一次定向补查，第二次请求只开放 `report`。
+补查仍使用原始 call ID 接收 observation。
 `answer` 调用还必须通过确定性的 CSV 安全校验才能终止任务；被拒绝的候选答案会收到可恢复
 的工具观察，以便模型修正后重提。
 
@@ -175,6 +200,7 @@ OpenAI-compatible Chat Completions 接口。
 | 工具 | 作用 | 输入 |
 | --- | --- | --- |
 | `list_context` | 列出 `context/` 下的文件和目录。 | `max_depth` |
+| `explore` | 启动一次 Phase 1 参考说明书子 Agent；运行时扫描全部支持文件、提取带锚点的 knowledge 证据，模型拆解任务并返回推荐来源/字段、候选连接和不确定性。最多补查一次，成功或 fail-open 后都会移除。 | 无（`{}`） |
 | `read_csv` | 读取 CSV 预览。 | `path`、`max_rows` |
 | `read_json` | 读取 JSON 预览。 | `path`、`max_chars` |
 | `read_doc` | 读取文本文档预览。 | `path`、`max_chars` |
@@ -184,6 +210,17 @@ OpenAI-compatible Chat Completions 接口。
 | `answer` | 提交最终答案表格并结束当前任务。 | `columns`、`rows` |
 
 所有文件路径都必须是相对于任务 `context/` 目录的相对路径。
+`explore` 不再把 `inspect_files` 暴露给模型：确定性 Inventory 在首个 Explorer 请求前
+完成，覆盖 CSV/TSV、JSON、SQLite、Markdown、文本和文本型 PDF；`knowledge.md` 使用
+独立预算选择与题目最相关的章节，并以 `knowledge.source_evidence` 进入最终说明书。
+首个请求同时生成 `task_requirements`、`recommended_sources`、
+`knowledge.applicable_rules`、候选 `join_paths` 和 `uncertainties`。如果必须补证，
+注册表只暴露 Inventory 中真实路径；没有 SQLite 时不暴露 SQL，第二次请求只暴露
+`report`。运行时合并全文件清单与 schema、校验路径/字段/evidence 引用并逐项忽略非法
+语义项。补查参数失败、工具失败或返回空证据时，运行时会强制添加 unresolved 需求和
+uncertainty，并把已知目标来源降级为 `candidate`，避免模型遗漏提醒。模型失败或超时
+时，fallback 仍保留 Inventory、knowledge 原文证据和显式未解决需求，不再进入开放式
+多轮探索。
 
 ## 输出
 
@@ -233,6 +270,8 @@ uv run dabench score-run artifacts/runs/<run_id> \
 [`docs/2026-07-24-native-tool-calling.md`](docs/2026-07-24-native-tool-calling.md)。
 确定性的提交前校验和纠错流程见
 [`docs/2026-07-24-answer-verification.md`](docs/2026-07-24-answer-verification.md)。
+受限 Explorer 的设计、预算、失败回退和评测边界见
+[`docs/2026-07-27-context-explorer.md`](docs/2026-07-27-context-explorer.md)。
 
 ## Contact
 
@@ -289,6 +328,7 @@ uv run dabench score-run artifacts/runs/<run_id> \
 | `src/data_agent_baseline/tools/sqlite.py` | `inspect_sqlite_schema`、`execute_context_sql` |
 | `src/data_agent_baseline/tools/contracts.py` | 原生工具的 Pydantic 输入契约 |
 | `src/data_agent_baseline/tools/registry.py` | JSON Schema 生成、校验、分发与终止型 `answer` |
+| `src/data_agent_baseline/exploration/` | 受限 Explorer 子 Agent 与确定性上下文清单 |
 | `src/data_agent_baseline/agents/model.py` | OpenAI-compatible 消息与原生 `tool_calls` Adapter |
 | `src/data_agent_baseline/agents/prompt.py` | system prompt 与 task prompt |
 | `src/data_agent_baseline/agents/react.py` | 原生工具调用 ReAct runtime |

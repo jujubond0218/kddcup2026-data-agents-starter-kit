@@ -26,7 +26,7 @@ class AgentConfig:
     model: str = "gpt-4.1-mini"
     api_base: str = "https://api.openai.com/v1"
     api_key: str = ""
-    max_steps: int = 16
+    max_steps: int = 20
     temperature: float = 0.0
     model_request_timeout_seconds: float = 20.0
     model_max_retries: int = 1
@@ -42,10 +42,27 @@ class RunConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ExplorerConfig:
+    enabled: bool = True
+    max_steps: int = 2
+    max_duration_seconds: float = 60.0
+    max_files: int = 64
+    max_preview_calls: int = 2
+    max_preview_chars: int = 2_000
+    max_inventory_chars: int = 12_000
+    max_report_chars: int = 4_000
+    max_total_read_bytes: int = 4 * 1024 * 1024
+    max_single_file_bytes: int = 256 * 1024
+    max_pdf_bytes: int = 2 * 1024 * 1024
+    max_pdf_pages: int = 3
+
+
+@dataclass(frozen=True, slots=True)
 class AppConfig:
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
     run: RunConfig = field(default_factory=RunConfig)
+    explorer: ExplorerConfig = field(default_factory=ExplorerConfig)
 
 
 def _path_value(raw_value: str | None, default_value: Path) -> Path:
@@ -62,10 +79,12 @@ def load_app_config(config_path: Path) -> AppConfig:
     dataset_defaults = DatasetConfig()
     agent_defaults = AgentConfig()
     run_defaults = RunConfig()
+    explorer_defaults = ExplorerConfig()
 
     dataset_payload = payload.get("dataset", {})
     agent_payload = payload.get("agent", {})
     run_payload = payload.get("run", {})
+    explorer_payload = payload.get("explorer", {})
 
     dataset_config = DatasetConfig(
         root_path=_path_value(dataset_payload.get("root_path"), dataset_defaults.root_path),
@@ -106,4 +125,40 @@ def load_app_config(config_path: Path) -> AppConfig:
             run_payload.get("task_timeout_seconds", run_defaults.task_timeout_seconds)
         ),
     )
-    return AppConfig(dataset=dataset_config, agent=agent_config, run=run_config)
+    explorer_config = ExplorerConfig(
+        enabled=bool(explorer_payload.get("enabled", explorer_defaults.enabled)),
+        max_steps=int(explorer_payload.get("max_steps", explorer_defaults.max_steps)),
+        max_duration_seconds=float(
+            explorer_payload.get(
+                "max_duration_seconds",
+                explorer_defaults.max_duration_seconds,
+            )
+        ),
+        max_files=int(explorer_payload.get("max_files", explorer_defaults.max_files)),
+        max_preview_calls=int(
+            explorer_payload.get("max_preview_calls", explorer_defaults.max_preview_calls)
+        ),
+        max_preview_chars=int(
+            explorer_payload.get("max_preview_chars", explorer_defaults.max_preview_chars)
+        ),
+        max_inventory_chars=int(
+            explorer_payload.get("max_inventory_chars", explorer_defaults.max_inventory_chars)
+        ),
+        max_report_chars=int(
+            explorer_payload.get("max_report_chars", explorer_defaults.max_report_chars)
+        ),
+        max_total_read_bytes=int(
+            explorer_payload.get("max_total_read_bytes", explorer_defaults.max_total_read_bytes)
+        ),
+        max_single_file_bytes=int(
+            explorer_payload.get("max_single_file_bytes", explorer_defaults.max_single_file_bytes)
+        ),
+        max_pdf_bytes=int(explorer_payload.get("max_pdf_bytes", explorer_defaults.max_pdf_bytes)),
+        max_pdf_pages=int(explorer_payload.get("max_pdf_pages", explorer_defaults.max_pdf_pages)),
+    )
+    return AppConfig(
+        dataset=dataset_config,
+        agent=agent_config,
+        run=run_config,
+        explorer=explorer_config,
+    )
