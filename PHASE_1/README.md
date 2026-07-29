@@ -102,7 +102,7 @@ run:
 
 explorer:
   enabled: true
-  max_steps: 10
+  max_steps: 2
   max_duration_seconds: 60
   max_files: 64
   max_preview_calls: 2
@@ -128,8 +128,8 @@ Config fields:
 | `run.run_id` | Optional run directory name. Defaults to a UTC timestamp if omitted. Required by `--resume`. |
 | `run.max_workers` | Parallel worker count for `run-benchmark`. |
 | `run.task_timeout_seconds` | Maximum wall-clock time per task. Set to `0` or a negative value to disable the task-level timeout. |
-| `explorer.enabled` | Exposes one argument-free `explore({})` call on the main Agent's first turn. The Explorer builds the file map; no Inventory is injected before the call. |
-| `explorer.max_steps` | Hard limit on Explorer model turns. Inspect, requirement locking, and report each occupy a standalone turn; other turns may execute up to two independent discovery tools. |
+| `explorer.enabled` | Exposes one argument-free `explore({})` call on the main Agent's first turn. Deterministic Inventory and knowledge evidence are built inside the tool. |
+| `explorer.max_steps` | Explorer model-request ceiling. The default and effective hard limit are two: report immediately or request one targeted follow-up, then report only. Larger legacy values still parse but do not reopen an exploration loop. |
 | `explorer.max_duration_seconds` | Explorer soft wall-clock limit. On expiry, successful evidence is converted into a bounded fallback data map before the task-level hard timeout. |
 
 ## CLI
@@ -188,10 +188,11 @@ uv run dabench run-benchmark \
 Tools are advertised through the OpenAI-compatible native `tools` field. The main Agent returns
 one `tool_call` per turn, the registry validates its JSON arguments with Pydantic before
 execution, and the result is returned as a `tool` message with the matching `tool_call_id`.
-The Explorer is the only scoped exception: after standalone `inspect_files({})`, it must use a
-standalone `lock_requirements` turn to freeze the question requirements and real candidate
-sources/fields. It may then return up to two independent targeted discovery calls in one turn;
-each receives a separate tool observation with its original call ID.
+The Explorer is the only scoped exception: the runtime first performs a deterministic bounded
+scan of every supported file and extracts source-anchored `knowledge.md` evidence. The child
+Agent then decomposes the task and submits its guide in one model request. Only when Inventory
+cannot resolve a critical source or field may it make one targeted follow-up; the second request
+exposes `report` only, and the follow-up receives its observation under the original call ID.
 An `answer` call must also pass deterministic CSV-safety verification before it can terminate
 the task; rejected candidates receive a recoverable tool observation for correction.
 The same Chat Completions flow works with Alibaba Cloud Model Studio's OpenAI-compatible
@@ -202,7 +203,7 @@ The baseline exposes these tools to the model:
 | Tool | Purpose | Inputs |
 | --- | --- | --- |
 | `list_context` | List files and directories under `context/`. | `max_depth` |
-| `explore` | Launch one bounded Phase 1 discovery sub-agent. It inspects files, locks the question to candidate paths and fields that actually exist in the Inventory, explicitly previews every `knowledge.md`, and may use bounded preview, grep, and read-only SQL. Deep calls cannot leave the locked plan. It is removed after the call even on fail-open. | none (`{}`) |
+| `explore` | Launch one Phase 1 reference-guide sub-agent. The runtime scans all supported files and extracts anchored knowledge evidence; the model decomposes the task and returns recommended sources/fields, candidate joins, and uncertainties. It may follow up once and is removed even on fail-open. | none (`{}`) |
 | `read_csv` | Read a CSV preview. | `path`, `max_rows` |
 | `read_json` | Read a JSON preview. | `path`, `max_chars` |
 | `read_doc` | Read a text document preview. | `path`, `max_chars` |
@@ -212,20 +213,19 @@ The baseline exposes these tools to the model:
 | `answer` | Submit the final answer table and terminate the task. | `columns`, `rows` |
 
 All file paths passed to tools must be relative to the task `context/` directory.
-Inside `explore`, the child registry is limited to `inspect_files`, `lock_requirements`,
-`preview_file`, `grep_context`, bounded read-only `execute_context_sql`, and terminal `report`.
-The locked plan is immutable. Every deep call must bind to real candidate paths and fields, with
-at most three calls per requirement. The runtime normalizes ambiguous-field discovery flags and
-adds omitted knowledge-review requirements. After knowledge review is attempted, `report` is
-available for an early unresolved result; once all required or ambiguous fields have evidence,
-only `report` remains available, and Turn 6 after locking is also a report-only deadline. The
-runtime issues 70% and 90% reminders against this normal six-turn budget and allows up to two
-free corrective final retries. The model submits only relevant evidence,
-requirement resolutions, and other semantic increments; the runtime merges the file list,
-schemas, locked requirements, and evidence provenance. Malformed semantic items are ignored
-individually, while overlong submissions are bounded instead of rejected wholesale. If no valid
-report is produced, fallback
-reuses the locked plan and selects at most eight higher-priority evidence items.
+`explore` no longer advertises `inspect_files` to the model. Deterministic Inventory is completed
+before the first Explorer request and covers CSV/TSV, JSON, SQLite, Markdown, text, and text-based
+PDF inputs. `knowledge.md` uses a separate budget to select the question-relevant section, which
+is preserved under `knowledge.source_evidence`. The first request produces
+`task_requirements`, `recommended_sources`, `knowledge.applicable_rules`, candidate
+`join_paths`, and `uncertainties`. If one follow-up is needed, tool schemas enumerate only real
+Inventory paths; SQL is absent without SQLite, and the second request exposes only `report`.
+The runtime merges the complete file list and schemas, validates path/field/evidence references,
+and ignores malformed semantic items individually. If follow-up arguments fail validation, the
+tool fails, or the result contains no material evidence, the runtime injects an unresolved
+requirement and uncertainty and downgrades a known target source to `candidate`. On model failure
+or timeout, fallback keeps Inventory, exact knowledge evidence, and explicit unresolved
+requirements instead of reopening an exploration loop.
 
 ## Outputs
 

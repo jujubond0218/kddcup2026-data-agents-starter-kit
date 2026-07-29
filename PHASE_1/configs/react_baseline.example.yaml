@@ -19,7 +19,7 @@ run:
 
 explorer:
   enabled: true
-  max_steps: 10
+  max_steps: 2
   max_duration_seconds: 60
   max_files: 64
   max_preview_calls: 2

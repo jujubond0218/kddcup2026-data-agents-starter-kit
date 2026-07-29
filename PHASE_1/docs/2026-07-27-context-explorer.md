@@ -1,108 +1,90 @@
 # Phase 1 Context Explorer
 
-当前实现采用与参考项目 Phase 1 发现流程一致的子 Agent 工作流，不再在主 Agent 请求模型
-前自动生成或注入 Inventory，也不再由本地规则判断“歧义”。启用 Explorer 时，主 Agent
-首轮只开放无参数 `explore({})`；子 Agent 的首个成功轮次必须单独调用
-`inspect_files({})`，第二个成功轮次必须单独调用 `lock_requirements` 锁定题目需求及真实
-候选来源，随后才能按需调用 `preview_file`、`grep_context` 和只读
-`execute_context_sql`，最后以独占一轮的 `report` 提交数据地图。完成或 fail-open 后，
-主 Agent 永久移除 `explore` 并恢复原有工具。
+当前实现把 Explorer 定位为主 Agent 的“任务参考说明书生成器”，而不是第二个解题
+Agent。主 Agent 首轮只开放一次无参数 `explore({})`；工具内部先确定性扫描全部支持
+文件并提取带来源锚点的 `knowledge.md` 相关证据，再用一次模型请求完成任务拆解与来源
+推荐。只有关键来源、字段或值域无法从 Inventory 判断时，才允许一次定向补查；补查后的
+第二次请求只开放 `report`。完成或 fail-open 后，主 Agent 永久移除 `explore` 并恢复
+原有工具。
 
-## 子 Agent 工具与数据地图
+## 确定性上下文包与 knowledge
 
-`inspect_files` 是确定性、有预算的子 Agent 工具，覆盖 CSV/TSV、JSON、SQLite、
-Markdown、文本和文本型 PDF，返回相对路径、类型、大小、schema、行数、字段画像、
-文档标题、warning 和候选关系。它只负责收集事实，不判断是否存在歧义，也不直接把
-`knowledge.md` 正文放进结果；如果扫描发现一个或多个大小写不敏感的 `knowledge.md`，
-子 Agent 必须对每个文件显式调用 `preview_file`。未尝试读取会以可恢复的
-`KNOWLEDGE_NOT_REVIEWED` 拒绝报告；读取失败则保留 warning evidence 并允许继续报告。
+模型不再调用 `inspect_files`。运行时在首个 Explorer 请求前有界扫描 CSV/TSV、JSON、
+SQLite、Markdown、文本和文本型 PDF，返回真实相对路径、格式、大小、schema、行数、
+字段画像、标题、少量值样本、候选关系和 warning。默认最多处理 64 个文件、总读取
+4 MiB、普通单文件 256 KiB，文本型 PDF 最多 2 MiB 和前三页；Inventory 最多
+12,000 字符。
 
-`lock_requirements` 把问题拆成最多 12 个稳定的小写需求 ID，覆盖实体、指标、过滤条件、
-时间范围、输出字段、知识规则和连接关系。每项需求只能声明 inspect 已发现的候选路径和
-字段，并明确 `needs_discovery`；一个需求出现多个真实候选字段时即表示显式待消歧状态，
-不能把命名相似直接当作已确认语义。运行时会自动把多候选字段规范为待探索需求，并为
-inspect 发现但模型漏列的 `knowledge.md` 补充读取需求，避免子 Agent 为协议 bookkeeping
-反复重提整份计划。锁定成功后计划不可修改，事件只记录需求、候选、规范化与歧义数量，
-不记录题目文本或完整计划。
+每个大小写不敏感的 `knowledge.md` 使用独立预算处理。运行时在单文件字节上限内读取
+文本，优先选择包含完整题目的 Markdown 章节，否则按题目词项重叠选择最相关章节，并在
+2,000 字符内保存原文 excerpt。证据包含稳定 ID、真实路径、章节、截断状态和原文，
+通过 `knowledge.source_evidence` 确定性进入最终说明书；模型不能删除或改写这部分事实。
+模型可在 `knowledge.applicable_rules` 中提炼与题目相关的公式、字段映射、值编码、单位、
+输出形状、例子和消歧规则，但每条规则必须引用真实 knowledge evidence ID 和来源路径。
+未锚定的规则会逐项丢弃并产生 warning，不会拒绝整个报告。
 
-`preview_file` 对 inspect 已发现且已锁定为候选的单个文件做更深入但有界的读取。
-`grep_context` 在一个已锁定的文本来源或 SQLite 文本列中执行大小写不敏感的有界正则
-搜索，不再接受无路径的全局搜索。Explorer 内的 `execute_context_sql` 仅允许单条
-`SELECT`、`WITH`、只读
-`PRAGMA` 或 `EXPLAIN`，最多返回 200 行，并通过只读连接、`query_only`、语句校验和执行
-时限共同拒绝写入、ATTACH、建索引及长时间查询。
+## 任务拆解与参考说明书
 
-每次 `preview_file`、`grep_context` 和 `execute_context_sql` 都必须携带一个到四个已
-锁定的 `requirement_ids`、简短 `purpose`，以及本次实际检查的候选 `target_fields`。
-运行时仍拒绝计划之外的路径和新 ID，但会丢弃未锁定的 `target_fields`；当模型漏写字段
-且当前路径存在锁定候选时，运行时自动绑定这些候选，避免把可确定修复的参数遗漏变成额外
-模型轮次。每项需求的深层调用仍限制为三次。模型
-调用 `report` 时只提交语义增量：`relevant_evidence`、`requirement_resolutions`、
-`selected_sources`、`field_semantics`、`knowledge`、`etl_candidates`、`join_paths`、
-`warnings` 和 `uncertainties`；`task_requirements`、文件清单、schema 与 evidence 来源由
-运行时合并，模型不能在最终报告中重写。一项
-`relevant_evidence` 只有在 evidence 存在、工具成功、支持的 requirement 已声明，且与
-工具调用时记录的 requirement 绑定一致时才会被接受。
+首个模型请求同时接收题目、Inventory、knowledge evidence 和可用路径，并提交：
 
-运行时确定性跟踪需求覆盖度：`needs_discovery=false` 的需求由 inspect 满足；普通发现
-需求至少需要一条成功且绑定一致的深层 evidence；有多个候选字段的需求必须实际覆盖所有
-候选字段，或由绑定到该需求的 `knowledge.md` evidence 支持。覆盖完成后子 Agent 只再看到
-`report`，避免对已满足需求继续交叉检查。在必须读取的 knowledge 已尝试后，未完全覆盖时
-也会同时开放 `report`，允许模型把无法继续判定的需求标为 `unresolved` 后及时结束，而
-不是为了满足机械覆盖条件耗尽轮次。`requirement_resolutions` 只能在已锁定候选中
-选择或排除字段，并引用已经选中的相关 evidence；无法确定时必须保留为 `unresolved`。
+- `task_interpretation`：整体任务和预期输出形状的简要解释；
+- `task_requirements`：最多 12 项实体、指标、过滤、时间、输出、knowledge 或连接需求；
+- `recommended_sources`：真实文件、可选表、候选字段、用途、理由、需求引用，以及
+  `confirmed` / `candidate` 状态；
+- `knowledge.applicable_rules`、候选 `join_paths`、`value_samples`、
+  `etl_candidates`、`uncertainties` 和客观 `warnings`。
 
-运行时始终生成全文件的极简背景 `files/schema_map`；未选择来源最多保留 inspect 得到的
-16 个基础字段。只有被 `relevant_evidence` 接受的 preview/grep/SQL observation 才能
-进入 `evidence_summaries`、深层 schema 和 `value_samples`。inspect 产生的弱
-relation candidates 不再自动变成 `join_paths`；连接必须由子 Agent 明确选择并引用相关
-证据。未知路径、字段、需求或 evidence 引用只会忽略对应语义项并产生 warning，不会让
-背景数据地图整体失效。所有连接始终标记为 candidate；`etl_candidates` 仅是咨询性发现，
-本 PR 不执行 ETL，也不因没有 ETL 产物拒绝报告。
+任务拆解不占独立模型轮次，也不是报告门禁。运行时验证需求 ID 唯一、路径存在、字段属于
+对应 schema、knowledge/evidence 引用真实、连接两端有效；非法语义项逐项忽略。全文件
+`files/schema_map` 与 knowledge 原文证据始终由运行时合并，模型不能用不完整清单覆盖
+它们。无法确认的语义必须以 uncertainty 和可执行核验提示交给主 Agent，不能伪装成
+confirmed。
 
-## 预算、协议与 fail-open
+## 一次补查、停止与 fail-open
 
-Explorer 默认最多 10 个普通模型轮次，软墙钟上限为 60 秒；10 轮是复杂任务的硬上限，
-不是期望平均值。需求锁定后第 6 轮是正常 report 截止点，该轮只开放 `report`；如果前置
-inspect 或锁定持续收到可恢复错误，10 轮仍作为最终安全上限。运行时以正常 6 轮预算的
-70% 和 90% 分别注入收敛提醒并记录聚合事件。
-`inspect_files`、`lock_requirements` 与 `report` 必须各自独占一轮；中间轮次最多包含两个独立发现工具调用，
-运行时按原顺序执行，并为每个调用返回匹配原始 `tool_call_id` 的独立 observation。子
-Agent 每轮只看到当前阶段合法的工具：首轮只有 `inspect_files`，第二轮只有
-`lock_requirements`，没有 SQLite 来源时不暴露 SQL；knowledge 读取完成后，`report`
-与仍可用的定向发现工具同时开放，需求覆盖完成或最后一轮时则只开放 `report`。若最后
-一轮没有调用 report，或 report 参数/语义契约
-被拒绝，运行时最多再请求两次只允许 report 的纠正响应；这些请求不增加
-`steps_used`，但仍受 60 秒软时限、模型请求超时和 usage/事件记录约束。
+第一次请求可直接 `report`，也可选择恰好一个定向 `preview_file`、`grep_context` 或
+只读 `execute_context_sql`。这些工具的 Pydantic schema 动态枚举 Inventory 中的真实
+路径：knowledge 不占普通 preview 额度，没有 SQLite 时完全不暴露 SQL，SQL 路径只允许
+`.db/.sqlite/.sqlite3`。发生补查后，第二次请求只看到 `report`；旧配置中大于 2 的
+`explorer.max_steps` 仍可解析，但不会重新开放第 3–10 轮。
 
-`explore` 和 `inspect_files` 的公开 schema 仍为空对象；对于部分 OpenAI-compatible
-模型为无参数工具生成的无意义占位字段，运行时仅在这两个空输入边界丢弃字段，避免参数
-形状错误阻止 fail-open。主 Agent 的“一轮一个工具”协议不变。
+运行时会统一评估补查结果，包含参数校验阶段失败、handler 失败以及“工具成功但没有实质
+证据”三种情况。grep 的零匹配、SQL 的零行和没有实质摘要的 preview 都视为未确认。
+即使模型随后遗漏 uncertainty，运行时也会添加一个 `followup_verification` unresolved
+需求和对应 uncertainty；已知补查路径关联的来源会降级为 `candidate`，并给出 evidence
+引用和主 Agent 核验提示。成功且有实质证据的补查不触发该兜底。
 
-扫描默认最多处理 64 个文件、总读取 4 MiB、普通单文件 256 KiB，文本型 PDF 最多读取
-2 MiB 和前三页；inspect 结果最多 12,000 字符，单个 preview 最多 2,000 字符，语义增量
-建议不超过 4,000 字符且 preview 最多两次。超出建议长度时运行时记录聚合事件并继续有界
-投影，不再拒绝整份报告；输出数据地图仍受 12,000 字符硬预算约束。所有路径限制在任务
-`context/` 内。损坏文件、非法正则、越权路径、超限与不支持输入返回结构化可恢复错误或
-warning。
+Explorer 继续受 60 秒软墙钟、模型请求超时和重试约束。模型失败、未提交合法 report 或
+到达软时限时，fallback 从确定性 Inventory、knowledge 原文证据和已成功补查结果生成
+说明书，添加显式 unresolved 任务需求和核验提示；若此前补查失败或无结果，同一运行时
+兜底也会保留。事件只记录步骤、计数、错误码、字符数和 knowledge 锚点数量，不写题目、
+原始报告或样本；主 Trace、120 秒任务硬超时、恢复和失败重跑语义保持不变。
 
-正常 report 与 fallback 共用同一个确定性投影器。若模型失败、10 轮及免费终止重试内
-没有合法 report、子工具失败或到达 60 秒软时限，fallback 从成功且带 requirement 绑定
-的深层 observation 中优先保留 knowledge 读取、每个“需求 × 工具”组合的最新 evidence，
-再按新近程度补足，最多选择 8 项。它直接复用不可变的 locked requirements，并为每项
-需求生成显式 `unresolved` 结果，因此不需要依赖最终 report 才能恢复问题拆解；未选择的
-中间尝试不会进入主报告。
-输出超过 12,000 字符时优先裁剪重复或咨询性内容，再裁剪深层 observation 摘要。没有
-证据时仍返回结构化失败，然后恢复主 Agent 原工具。Explorer 生命周期、预算提醒和免费
-重试的聚合信息写入 `events.jsonl`；完成事件只额外记录 requirement、相关 evidence、
-选中来源的数量和报告字符数，不写原始报告或样本。主 Trace、模型请求超时与重试、
-120 秒任务硬超时、恢复和失败重跑语义保持不变。
+## 参考说明书生成器 50 题实验
+
+2026-07-29 使用本地目标配置和 4 个 Runner worker 完成一次 50 题实验。当前实现包含
+确定性全文件扫描、独立 knowledge 证据、最多一次补查，以及补查失败或空结果时强制注入
+uncertainty 的运行时兜底。本轮 Runner 成功 38/50，缺失预测 12；总分为 0.5903，
+Mean Recall 为 0.5933，其中 28 题满分、3 题部分匹配、7 题无匹配。
+
+Explorer 启动和完成均为 50/50，knowledge 锚点覆盖 50/50，仅 1 题使用 fallback。
+3 题在一次模型请求内直接报告，47 题使用第二次请求；47 次补查中 28 次取得实质证据、
+7 次失败、12 次返回空证据，后两类共 19 次由运行时 uncertainty 兜底覆盖。
+`NOT_SQLITE`、`PATH_NOT_INSPECTED` 和 `PREVIEW_BUDGET_EXHAUSTED` 均为 0，但
+Explorer 仍出现 14 次参数校验错误和 1 次非法参数 JSON，说明停止和不确定性保留已经
+收敛，补查触发频率与参数生成仍有优化空间。
+
+本轮墙钟约 734 秒；Explorer 共 97 次模型请求、约 50.6 万 Token，主 Agent 共 456 次
+模型请求、约 435.7 万 Token。该次总分高于本文旧记录中的 0.5703，但 Runner 成功数由
+旧记录的 40 降为 38，且 worker 数、实现和真实服务波动均可能影响结果。因此这是一条
+当前配置下的单轮实证记录，不足以证明 Explorer 对语义准确率具有稳定因果提升。
 
 ## 历史实验
 
-下述 v1、v2 和 bad-case 定向增强结果是已淘汰设计的历史记录，用于解释为何移除自动
-Inventory、歧义规则和要求模型复制 `focus/candidate_paths` 的接口。它们不能代表当前
-工作流对齐版本的结果；当前版本必须先通过固定 9 题门槛，才会运行一次 50 题实验。
+下述结果均属于当前参考说明书架构之前的已淘汰设计，用于解释为何移除开放式多轮
+Explorer、严格需求锁定、歧义规则和要求模型复制 `focus/candidate_paths` 的接口。
+它们不能代表当前版本；当前版本必须先通过自动化检查和固定 9 题门槛，才会运行一次
+50 题实验。
 
 ## 50 题实验结果
 

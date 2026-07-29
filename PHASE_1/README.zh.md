@@ -102,7 +102,7 @@ run:
 
 explorer:
   enabled: true
-  max_steps: 10
+  max_steps: 2
   max_duration_seconds: 60
   max_files: 64
   max_preview_calls: 2
@@ -128,8 +128,8 @@ explorer:
 | `run.run_id` | 可选，指定运行目录名。不传时默认使用 UTC 时间戳；使用 `--resume` 时必须填写。 |
 | `run.max_workers` | `run-benchmark` 并行 worker 数。 |
 | `run.task_timeout_seconds` | 单个任务允许的最长墙钟时间。设为 `0` 或负数可关闭任务级超时。 |
-| `explorer.enabled` | 是否在主 Agent 首轮仅暴露一次无参数 `explore({})`；文件地图由子 Agent 生成，不在调用前自动注入 Inventory。 |
-| `explorer.max_steps` | Explorer 子 Agent 的模型轮次硬上限；inspect、需求锁定和 report 各自独占一轮，其余轮次最多执行两个独立发现工具。 |
+| `explorer.enabled` | 是否在主 Agent 首轮仅暴露一次无参数 `explore({})`；确定性 Inventory 与 knowledge 证据在工具内部生成。 |
+| `explorer.max_steps` | Explorer 模型请求上限，默认和有效硬上限均为 2；第一次直接报告或提出一次定向补查，第二次只允许报告。旧配置中的更大值仍可读取，但不会扩展自由探索轮数。 |
 | `explorer.max_duration_seconds` | Explorer 软墙钟上限；超限时先用已有证据生成有界 fallback，避免直接耗尽任务级硬超时。 |
 
 ## CLI
@@ -188,9 +188,10 @@ uv run dabench run-benchmark \
 `tool_call`，注册表在执行前使用 Pydantic 校验 JSON 参数，结果再通过带有匹配
 `tool_call_id` 的 `tool` 消息返回。现有 `agent.api_base` 配置也可直接连接阿里云百炼
 OpenAI-compatible Chat Completions 接口。
-Explorer 是唯一的局部例外：其首轮必须单独调用 `inspect_files({})`，第二轮必须单独
-调用 `lock_requirements` 锁定题目需求、候选来源与候选字段，之后每轮最多返回两个彼此
-独立的定向发现调用，每个调用仍按原始 call ID 分别接收 observation。
+Explorer 是唯一的局部例外：运行时先确定性、有界地扫描全部支持文件并提取带来源锚点的
+`knowledge.md` 相关章节，再让子 Agent 在一次模型请求中拆解任务并提交说明书；只有
+Inventory 无法判断关键来源或字段时，才允许一次定向补查，第二次请求只开放 `report`。
+补查仍使用原始 call ID 接收 observation。
 `answer` 调用还必须通过确定性的 CSV 安全校验才能终止任务；被拒绝的候选答案会收到可恢复
 的工具观察，以便模型修正后重提。
 
@@ -199,7 +200,7 @@ Explorer 是唯一的局部例外：其首轮必须单独调用 `inspect_files({
 | 工具 | 作用 | 输入 |
 | --- | --- | --- |
 | `list_context` | 列出 `context/` 下的文件和目录。 | `max_depth` |
-| `explore` | 启动一次受限的 Phase 1 发现子 Agent；它先扫描文件，再锁定题目需求及 Inventory 中真实存在的候选路径/字段，显式预览每个 `knowledge.md`，并按需使用有界 preview、grep 和只读 SQL。深层调用不能越出锁定计划；成功或 fail-open 后都会移除。 | 无（`{}`） |
+| `explore` | 启动一次 Phase 1 参考说明书子 Agent；运行时扫描全部支持文件、提取带锚点的 knowledge 证据，模型拆解任务并返回推荐来源/字段、候选连接和不确定性。最多补查一次，成功或 fail-open 后都会移除。 | 无（`{}`） |
 | `read_csv` | 读取 CSV 预览。 | `path`、`max_rows` |
 | `read_json` | 读取 JSON 预览。 | `path`、`max_chars` |
 | `read_doc` | 读取文本文档预览。 | `path`、`max_chars` |
@@ -209,17 +210,17 @@ Explorer 是唯一的局部例外：其首轮必须单独调用 `inspect_files({
 | `answer` | 提交最终答案表格并结束当前任务。 | `columns`、`rows` |
 
 所有文件路径都必须是相对于任务 `context/` 目录的相对路径。
-`explore` 内部的子 Agent 注册表只包含 `inspect_files`、`lock_requirements`、
-`preview_file`、`grep_context`、有界只读 `execute_context_sql` 和终止工具 `report`；
-这些发现工具不会与主 Agent 的常规计算工具同时暴露。锁定计划成功后不可修改，深层调用
-必须绑定真实候选路径/字段，每项需求最多三次；运行时自动规范多候选字段的探索标记并补充
-遗漏的 knowledge 读取需求。knowledge 已尝试后可提前提交 `report`，显式混淆字段全部
-取得证据后则只再开放 `report`；锁定后的第 6 轮也会强制只报告。达到正常 6 轮预算的
-70% 和 90% 时会提醒收敛，非法终止最多获得两次免费纠正
-重试。模型在 `report` 中只提交相关 evidence、需求消歧和其他语义增量；文件清单、schema、
-锁定需求与 evidence 来源由运行时合并；非法语义项会逐项忽略，超出建议长度的报告会
-继续有界投影而不是整体拒绝。即使最终没有合法 `report`，fallback 也会复用
-锁定需求并最多选择 8 条较高优先级 evidence，避免丢失探索成果或注入全部中间尝试。
+`explore` 不再把 `inspect_files` 暴露给模型：确定性 Inventory 在首个 Explorer 请求前
+完成，覆盖 CSV/TSV、JSON、SQLite、Markdown、文本和文本型 PDF；`knowledge.md` 使用
+独立预算选择与题目最相关的章节，并以 `knowledge.source_evidence` 进入最终说明书。
+首个请求同时生成 `task_requirements`、`recommended_sources`、
+`knowledge.applicable_rules`、候选 `join_paths` 和 `uncertainties`。如果必须补证，
+注册表只暴露 Inventory 中真实路径；没有 SQLite 时不暴露 SQL，第二次请求只暴露
+`report`。运行时合并全文件清单与 schema、校验路径/字段/evidence 引用并逐项忽略非法
+语义项。补查参数失败、工具失败或返回空证据时，运行时会强制添加 unresolved 需求和
+uncertainty，并把已知目标来源降级为 `candidate`，避免模型遗漏提醒。模型失败或超时
+时，fallback 仍保留 Inventory、knowledge 原文证据和显式未解决需求，不再进入开放式
+多轮探索。
 
 ## 输出
 

@@ -44,7 +44,7 @@ class RunConfig:
 @dataclass(frozen=True, slots=True)
 class ExplorerConfig:
     enabled: bool = True
-    max_steps: int = 10
+    max_steps: int = 2
     max_duration_seconds: float = 60.0
     max_files: int = 64
     max_preview_calls: int = 2
