@@ -62,6 +62,9 @@ Explorer 继续受 60 秒软墙钟、模型请求超时和重试约束。模型�
 
 ## 参考说明书生成器 50 题实验
 
+对应实现、测试与实验记录汇总于个人 Fork
+[PR #5](https://github.com/jujubond0218/kddcup2026-data-agents-starter-kit/pull/5)。
+
 2026-07-29 使用本地目标配置和 4 个 Runner worker 完成一次 50 题实验。当前实现包含
 确定性全文件扫描、独立 knowledge 证据、最多一次补查，以及补查失败或空结果时强制注入
 uncertainty 的运行时兜底。本轮 Runner 成功 38/50，缺失预测 12；总分为 0.5903，
