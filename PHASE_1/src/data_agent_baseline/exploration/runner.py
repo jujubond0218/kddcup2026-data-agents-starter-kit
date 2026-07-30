@@ -37,6 +37,8 @@ from data_agent_baseline.tools.sqlite import execute_exploration_sql
 SQLITE_SUFFIXES = (".db", ".sqlite", ".sqlite3")
 KNOWLEDGE_NAME = "knowledge.md"
 MAX_REQUIREMENTS = 12
+MAX_OUTPUT_COLUMNS = 12
+MAX_HELPER_FIELDS = 24
 MAX_RECOMMENDED_SOURCES = 16
 MAX_KNOWLEDGE_RULES = 24
 MAX_UNCERTAINTIES = 12
@@ -58,6 +60,8 @@ RequirementKind = Literal[
 ]
 RequirementStatus = Literal["resolved", "unresolved"]
 SourceStatus = Literal["confirmed", "candidate"]
+OutputKind = Literal["direct", "derived", "semantic"]
+HelperRole = Literal["filter", "join", "sort", "group"]
 KnowledgeKind = Literal[
     "field_mapping",
     "formula",
@@ -130,6 +134,96 @@ class TaskRequirement(_GuideItem):
             "resolved" if raw_status in {"resolved", "confirmed", "complete"} else "unresolved"
         )
         return normalized
+
+
+class SourceField(_GuideItem):
+    path: str = Field(min_length=1, max_length=500)
+    table: str | None = Field(default=None, max_length=200)
+    field: str | None = Field(default=None, max_length=200)
+
+
+class OutputColumn(_GuideItem):
+    name: str = Field(
+        min_length=1,
+        max_length=200,
+        description=(
+            "One final answer column explicitly requested by the question. A useful identifier, "
+            "ranking value, join key, or verification field is not an answer column."
+        ),
+    )
+    kind: OutputKind = Field(
+        description=(
+            "direct for a real structured field, derived for a requested calculation over real "
+            "inputs, or semantic for a value extracted from narrative evidence."
+        )
+    )
+    source_fields: list[SourceField] = Field(
+        default_factory=list,
+        max_length=8,
+        description="Real inputs that ground this one answer column.",
+    )
+    operation: str | None = Field(
+        default=None,
+        max_length=300,
+        description=(
+            "Required only for a requested derived calculation. Do not concatenate atomic name "
+            "fields unless an anchored output-shape rule explicitly requires one string."
+        ),
+    )
+    reason: str = Field(
+        min_length=1,
+        max_length=500,
+        description=(
+            "Explain why the question requests this column. 'Useful context', identification, "
+            "ranking, joining, or verification alone is not sufficient."
+        ),
+    )
+    requirement_ids: list[str] = Field(default_factory=list, max_length=12)
+    evidence_refs: list[str] = Field(default_factory=list, max_length=8)
+    status: SourceStatus
+
+    @field_validator("requirement_ids", "evidence_refs")
+    @classmethod
+    def _unique_refs(cls, values: list[str]) -> list[str]:
+        return list(dict.fromkeys(values))
+
+    @model_validator(mode="after")
+    def _validate_kind_contract(self) -> OutputColumn:
+        if self.kind == "direct" and len(self.source_fields) != 1:
+            raise ValueError("direct output columns require exactly one source field")
+        if self.kind == "derived" and not self.source_fields:
+            raise ValueError("derived output columns require at least one source field")
+        if self.kind == "derived" and not (self.operation or "").strip():
+            raise ValueError("derived output columns require an operation")
+        if self.kind != "derived" and self.operation is not None:
+            raise ValueError("only derived output columns may declare an operation")
+        if self.kind == "semantic" and not self.source_fields and not self.evidence_refs:
+            raise ValueError("semantic output columns require a source or evidence reference")
+        return self
+
+
+class HelperField(_GuideItem):
+    source: SourceField
+    role: HelperRole
+    reason: str = Field(min_length=1, max_length=500)
+    requirement_ids: list[str] = Field(default_factory=list, max_length=12)
+
+    @field_validator("requirement_ids")
+    @classmethod
+    def _unique_requirement_ids(cls, values: list[str]) -> list[str]:
+        return list(dict.fromkeys(values))
+
+
+class AnswerProjection(_GuideItem):
+    columns: list[OutputColumn] = Field(
+        default_factory=list,
+        max_length=MAX_OUTPUT_COLUMNS,
+        description=(
+            "The smallest final table requested by the question. Do not return a whole record "
+            "when one content field answers the question."
+        ),
+    )
+    helper_fields: list[HelperField] = Field(default_factory=list, max_length=MAX_HELPER_FIELDS)
 
 
 class RecommendedSource(_GuideItem):
@@ -301,6 +395,7 @@ class ExplorerReportInput(BaseModel):
         default_factory=list,
         max_length=MAX_REQUIREMENTS,
     )
+    answer_projection: AnswerProjection = Field(default_factory=AnswerProjection)
     recommended_sources: list[RecommendedSource] = Field(
         default_factory=list,
         max_length=MAX_RECOMMENDED_SOURCES,
@@ -329,8 +424,12 @@ class ExplorerReportInput(BaseModel):
         warnings = normalized.get("warnings", [])
         if not isinstance(warnings, list):
             warnings = [warnings]
+        if not isinstance(normalized.get("answer_projection"), dict):
+            normalized["answer_projection"] = {}
         item_models: dict[str, type[BaseModel]] = {
             "task_requirements": TaskRequirement,
+            "answer_projection.columns": OutputColumn,
+            "answer_projection.helper_fields": HelperField,
             "recommended_sources": RecommendedSource,
             "etl_candidates": EtlCandidate,
             "join_paths": JoinCandidate,
@@ -338,6 +437,8 @@ class ExplorerReportInput(BaseModel):
         }
         item_limits = {
             "task_requirements": MAX_REQUIREMENTS,
+            "answer_projection.columns": MAX_OUTPUT_COLUMNS,
+            "answer_projection.helper_fields": MAX_HELPER_FIELDS,
             "recommended_sources": MAX_RECOMMENDED_SOURCES,
             "etl_candidates": MAX_ETL_CANDIDATES,
             "join_paths": MAX_JOIN_PATHS,
@@ -345,13 +446,19 @@ class ExplorerReportInput(BaseModel):
         }
         warning_codes = {
             "task_requirements": "INVALID_TASK_REQUIREMENT",
+            "answer_projection.columns": "INVALID_OUTPUT_COLUMN",
+            "answer_projection.helper_fields": "INVALID_HELPER_FIELD",
             "recommended_sources": "INVALID_RECOMMENDED_SOURCE",
             "etl_candidates": "INVALID_ETL_CANDIDATE",
             "join_paths": "INVALID_JOIN_CANDIDATE",
             "uncertainties": "INVALID_UNCERTAINTY",
         }
         for field_name, item_model in item_models.items():
-            raw_items = normalized.get(field_name, [])
+            if field_name.startswith("answer_projection."):
+                projection = normalized["answer_projection"]
+                raw_items = projection.get(field_name.rsplit(".", 1)[-1], [])
+            else:
+                raw_items = normalized.get(field_name, [])
             if not isinstance(raw_items, list):
                 raw_items = [raw_items]
             valid_items = []
@@ -360,7 +467,11 @@ class ExplorerReportInput(BaseModel):
                     valid_items.append(item_model.model_validate(raw_item).model_dump(mode="json"))
                 except ValidationError:
                     warnings.append({"code": warning_codes[field_name]})
-            normalized[field_name] = valid_items
+            if field_name.startswith("answer_projection."):
+                projection = normalized["answer_projection"]
+                projection[field_name.rsplit(".", 1)[-1]] = valid_items
+            else:
+                normalized[field_name] = valid_items
 
         raw_knowledge = normalized.get("knowledge", {})
         raw_rules = (
@@ -464,15 +575,49 @@ uncertainty. The runtime also enforces this as a deterministic safety net.
 The report must:
 1. Decompose the question into at most 12 task_requirements covering entities,
    measures, filters, time scope, requested outputs, knowledge rules, and joins.
-2. Map each requirement to recommended_sources. Mark a source confirmed only
+2. Build answer_projection as the smallest final table requested by the
+   question. Classify each output column as direct, derived, or semantic and
+   anchor it to real source fields or evidence. Derived outputs require an
+   explicit operation and real inputs. Keep filtering, joining, sorting, and
+   grouping fields in helper_fields; do not include them as answer columns
+   unless the question explicitly requests them. Preserve separate atomic
+   source fields as separate answer columns unless the question or anchored
+   knowledge explicitly requires concatenation or another representation.
+3. Map each requirement to recommended_sources. Mark a source confirmed only
    when the supplied evidence supports it; otherwise mark it candidate.
-3. Carry applicable formulas, field mappings, value codes, units, output shapes,
+4. Carry applicable formulas, field mappings, value codes, units, output shapes,
    examples, and disambiguation rules into knowledge.applicable_rules. Every rule
    must cite a supplied knowledge evidence ID and source path.
-4. Put unresolved or ambiguous choices in uncertainties with a concrete check
+5. Put unresolved or ambiguous choices in uncertainties with a concrete check
    the main Agent can perform. Do not guess.
-5. Report joins only as candidates. Do not join complete datasets, aggregate,
+6. Report joins only as candidates. Do not join complete datasets, aggregate,
    count, write SQL, execute Python, perform ETL, or submit an answer.
+
+Projection rules:
+- Read the requested output from the question, not from every field needed to
+  solve it. An entity mentioned in a filter does not make its identifier an
+  answer column. Fields used to select a maximum/minimum are sort helpers unless
+  the question also asks for that value. Join keys and record IDs are helpers
+  unless explicitly requested.
+- When a question asks "what is the comment/title/name/description", return the
+  canonical content/name field, not the whole record. Return identifiers,
+  scores, or metadata only when the question explicitly requests them or asks
+  for full record/details.
+- A maximum/minimum phrase selects a row. For "what is the comment with the
+  highest score", Text is the answer and Score is a sort helper. Score becomes
+  an answer only for wording such as "what is the highest score" or "include its
+  score". Never add an output merely because it is useful context, identifies a
+  record, or helps verification.
+- A request such as "for customers matching X, give their consumption" asks for
+  consumption; CustomerID remains a filter/join helper unless identification is
+  also requested.
+- If knowledge says that first_name and last_name together represent a full
+  name or that both must be used, emit two separate output columns. That wording
+  alone is not evidence for concatenation. Concatenate only when the question or
+  anchored knowledge explicitly specifies a single formatted name string.
+- For outputs extracted from narrative Markdown/PDF, use semantic columns with
+  the real document path and an evidence reference. Do not invent a structured
+  schema field merely to mark the output confirmed.
 
 Use only paths and fields present in the supplied Inventory. Observed data wins
 when it conflicts with documentation. An incomplete, explicit guide is better
@@ -954,6 +1099,131 @@ class _ExplorerTools:
                 schema_map[str(item["path"])] = summary
         return schema_map
 
+    def _valid_source_field(
+        self,
+        source: SourceField,
+        *,
+        allow_unstructured_field: bool,
+    ) -> bool:
+        if source.path not in self.discovered_paths:
+            return False
+        tables = self.field_map.get(source.path, {})
+        if source.table is not None and source.table not in tables:
+            return False
+        if source.field is None:
+            return True
+        known_fields = self._known_fields(source.path, source.table)
+        if known_fields:
+            return source.field in known_fields
+        return allow_unstructured_field
+
+    def _project_answer_projection(
+        self,
+        raw_projection: dict[str, Any],
+        requirement_ids: set[str],
+        evidence_ids: set[str],
+        warnings: list[Any],
+    ) -> dict[str, Any]:
+        projected_columns: list[dict[str, Any]] = []
+        raw_columns = raw_projection.get("columns", [])
+        if not isinstance(raw_columns, list):
+            raw_columns = []
+        for raw in raw_columns[:MAX_OUTPUT_COLUMNS]:
+            try:
+                column = OutputColumn.model_validate(raw)
+            except ValidationError:
+                warnings.append({"code": "INVALID_OUTPUT_COLUMN"})
+                continue
+            refs = [ref for ref in column.evidence_refs if ref in evidence_ids]
+            allow_unstructured = column.kind == "semantic" and bool(refs)
+            valid_sources = [
+                source
+                for source in column.source_fields
+                if self._valid_source_field(
+                    source,
+                    allow_unstructured_field=allow_unstructured,
+                )
+            ]
+            if len(valid_sources) != len(column.source_fields):
+                warnings.append(
+                    {
+                        "code": "UNKNOWN_OUTPUT_SOURCE_DROPPED",
+                        "output_column": column.name,
+                    }
+                )
+
+            status = column.status
+            if column.kind == "direct":
+                confirmable = (
+                    len(valid_sources) == 1
+                    and valid_sources[0].field is not None
+                    and bool(
+                        self._known_fields(
+                            valid_sources[0].path,
+                            valid_sources[0].table,
+                        )
+                    )
+                )
+            elif column.kind == "derived":
+                confirmable = (
+                    len(valid_sources) == len(column.source_fields)
+                    and bool(valid_sources)
+                    and bool((column.operation or "").strip())
+                )
+            else:
+                confirmable = bool(valid_sources or refs) and bool(refs)
+            if status == "confirmed" and not confirmable:
+                status = "candidate"
+                warnings.append(
+                    {
+                        "code": "OUTPUT_COLUMN_DOWNGRADED",
+                        "output_column": column.name,
+                    }
+                )
+            projected_columns.append(
+                {
+                    **column.model_dump(mode="json"),
+                    "source_fields": [source.model_dump(mode="json") for source in valid_sources],
+                    "requirement_ids": [
+                        item for item in column.requirement_ids if item in requirement_ids
+                    ],
+                    "evidence_refs": refs,
+                    "status": status,
+                }
+            )
+
+        projected_helpers: list[dict[str, Any]] = []
+        raw_helpers = raw_projection.get("helper_fields", [])
+        if not isinstance(raw_helpers, list):
+            raw_helpers = []
+        for raw in raw_helpers[:MAX_HELPER_FIELDS]:
+            try:
+                helper = HelperField.model_validate(raw)
+            except ValidationError:
+                warnings.append({"code": "INVALID_HELPER_FIELD"})
+                continue
+            if (
+                not self._valid_source_field(
+                    helper.source,
+                    allow_unstructured_field=False,
+                )
+                or helper.source.field is None
+            ):
+                warnings.append({"code": "UNKNOWN_HELPER_FIELD_DROPPED"})
+                continue
+            projected_helpers.append(
+                {
+                    **helper.model_dump(mode="json"),
+                    "requirement_ids": [
+                        item for item in helper.requirement_ids if item in requirement_ids
+                    ],
+                }
+            )
+        return {
+            "columns": projected_columns,
+            "helper_fields": projected_helpers,
+        }
+
     def _project_requirements(
         self,
         raw_items: list[dict[str, Any]],
@@ -1263,14 +1533,15 @@ class _ExplorerTools:
         )
         fields = (
             ("task_interpretation", 0.04),
-            ("task_requirements", 0.10),
-            ("recommended_sources", 0.16),
-            ("files", 0.15),
-            ("schema_map", 0.18),
-            ("knowledge", 0.18),
+            ("task_requirements", 0.08),
+            ("answer_projection", 0.10),
+            ("recommended_sources", 0.14),
+            ("files", 0.14),
+            ("schema_map", 0.16),
+            ("knowledge", 0.16),
             ("etl_candidates", 0.03),
             ("join_paths", 0.05),
-            ("value_samples", 0.04),
+            ("value_samples", 0.03),
             ("uncertainties", 0.05),
             ("warnings", 0.02),
         )
@@ -1297,6 +1568,41 @@ class _ExplorerTools:
             requirement_ids,
             warnings,
         )
+        answer_projection = self._project_answer_projection(
+            arguments.answer_projection.model_dump(mode="json"),
+            requirement_ids,
+            evidence_ids,
+            warnings,
+        )
+        output_requirements = {
+            str(item["id"])
+            for item in requirements
+            if item.get("kind") == "output" and item.get("status") == "resolved"
+        }
+        unresolved_output = any(
+            item.get("kind") == "output" and item.get("status") != "resolved"
+            for item in requirements
+        )
+        covered_output_requirements = {
+            str(requirement_id)
+            for column in answer_projection["columns"]
+            for requirement_id in column.get("requirement_ids", [])
+        }
+        every_column_is_requested = all(
+            output_requirements
+            & {str(requirement_id) for requirement_id in column.get("requirement_ids", [])}
+            for column in answer_projection["columns"]
+        )
+        answer_projection["enforceable"] = (
+            bool(output_requirements)
+            and not unresolved_output
+            and output_requirements <= covered_output_requirements
+            and bool(answer_projection["columns"])
+            and every_column_is_requested
+            and all(column.get("status") == "confirmed" for column in answer_projection["columns"])
+        )
+        if not answer_projection["enforceable"]:
+            warnings.append({"code": "ANSWER_PROJECTION_NOT_ENFORCEABLE"})
         uncertainties = self._project_uncertainties(
             arguments.uncertainties,
             requirement_ids,
@@ -1307,6 +1613,7 @@ class _ExplorerTools:
         report = {
             "task_interpretation": arguments.task_interpretation,
             "task_requirements": requirements,
+            "answer_projection": answer_projection,
             "recommended_sources": sources,
             "files": self._base_files(),
             "schema_map": self._base_schema_map(),
@@ -1361,6 +1668,11 @@ class _ExplorerTools:
         report = {
             "task_interpretation": "Explorer semantic synthesis did not complete.",
             "task_requirements": [requirement],
+            "answer_projection": {
+                "columns": [],
+                "helper_fields": [],
+                "enforceable": False,
+            },
             "recommended_sources": recommended,
             "files": self._base_files(),
             "schema_map": self._base_schema_map(),
@@ -1413,8 +1725,9 @@ class _ExplorerTools:
             name="report",
             description=(
                 "Submit the structured reference guide. Include task_interpretation, "
-                "task_requirements, recommended_sources, knowledge.applicable_rules, "
-                "candidate join_paths, uncertainties, and objective warnings. The "
+                "task_requirements, answer_projection, recommended_sources, "
+                "knowledge.applicable_rules, candidate join_paths, uncertainties, "
+                "and objective warnings. The "
                 "runtime supplies files, schema_map, and knowledge source evidence."
             ),
             input_model=ExplorerReportInput,
@@ -1529,6 +1842,10 @@ class ExplorerRunner:
                 "file_count": len(report.get("files", [])),
                 "schema_count": len(report.get("schema_map", {})),
                 "requirement_count": len(report.get("task_requirements", [])),
+                "output_column_count": len(report.get("answer_projection", {}).get("columns", [])),
+                "helper_field_count": len(
+                    report.get("answer_projection", {}).get("helper_fields", [])
+                ),
                 "recommended_source_count": len(report.get("recommended_sources", [])),
                 "knowledge_evidence_count": len(
                     report.get("knowledge", {}).get("source_evidence", [])
@@ -1774,8 +2091,8 @@ def create_explorer_tool_spec(
             "Use first as explore({}). It deterministically scans all supported "
             "Phase 1 context files, extracts source-anchored knowledge.md evidence, "
             "and uses at most two model requests to return task requirements, "
-            "recommended files and fields, knowledge rules, candidate joins, and "
-            "explicit uncertainties."
+            "a source-grounded answer projection, recommended files and fields, "
+            "knowledge rules, candidate joins, and explicit uncertainties."
         ),
         input_model=ExploreInput,
         handler=ExplorerToolHandler(

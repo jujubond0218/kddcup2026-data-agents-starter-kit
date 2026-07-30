@@ -98,6 +98,38 @@ def _report_payload(**overrides) -> dict:
                 "status": "resolved",
             },
         ],
+        "answer_projection": {
+            "columns": [
+                {
+                    "name": "revenue",
+                    "kind": "direct",
+                    "source_fields": [
+                        {
+                            "path": "sales.csv",
+                            "table": None,
+                            "field": "amount",
+                        }
+                    ],
+                    "operation": None,
+                    "reason": "The question requests revenue and knowledge maps it to amount.",
+                    "requirement_ids": ["output_revenue"],
+                    "evidence_refs": ["knowledge:1"],
+                    "status": "confirmed",
+                }
+            ],
+            "helper_fields": [
+                {
+                    "source": {
+                        "path": "sales.csv",
+                        "table": None,
+                        "field": "customer_id",
+                    },
+                    "role": "filter",
+                    "reason": "Customer identifiers may locate rows but are not requested.",
+                    "requirement_ids": ["measure_revenue"],
+                }
+            ],
+        },
         "recommended_sources": [
             {
                 "path": "sales.csv",
@@ -161,6 +193,7 @@ def test_direct_report_uses_one_request_and_preserves_knowledge_evidence(tmp_pat
     assert evidence[0]["path"] == "knowledge.md"
     assert "Revenue maps to the `amount` field." in evidence[0]["excerpt"]
     assert result.report["knowledge"]["applicable_rules"][0]["evidence_refs"] == ["knowledge:1"]
+    assert result.report["answer_projection"]["enforceable"] is True
     completed = next(payload for kind, payload in events if kind == "explorer_completed")
     assert completed["knowledge_evidence_count"] == 1
     assert completed["requirement_count"] == 2
@@ -173,6 +206,12 @@ def test_report_schema_describes_nested_guide_items_and_normalizes_common_aliase
     assert schema["properties"]["recommended_sources"]["items"]["$ref"].endswith(
         "/RecommendedSource"
     )
+    assert schema["properties"]["answer_projection"]["$ref"].endswith("/AnswerProjection")
+    assert schema["$defs"]["OutputColumn"]["properties"]["kind"]["enum"] == [
+        "direct",
+        "derived",
+        "semantic",
+    ]
     assert schema["$defs"]["TaskRequirement"]["properties"]["kind"]["enum"] == [
         "entity",
         "measure",
@@ -221,6 +260,125 @@ def test_report_schema_describes_nested_guide_items_and_normalizes_common_aliase
     assert report.task_requirements[0].status == "resolved"
     assert report.recommended_sources[0].fields == ["amount"]
     assert report.knowledge.applicable_rules[0].evidence_refs == ["knowledge:1"]
+
+
+def test_answer_projection_keeps_grounded_direct_derived_and_semantic_outputs(tmp_path):
+    task = _task(tmp_path)
+    payload = _report_payload(
+        answer_projection={
+            "columns": [
+                {
+                    "name": "amount",
+                    "kind": "direct",
+                    "source_fields": [{"path": "sales.csv", "table": None, "field": "amount"}],
+                    "operation": None,
+                    "reason": "Return the observed amount field.",
+                    "requirement_ids": ["output_revenue"],
+                    "evidence_refs": [],
+                    "status": "confirmed",
+                },
+                {
+                    "name": "total_revenue",
+                    "kind": "derived",
+                    "source_fields": [{"path": "sales.csv", "table": None, "field": "amount"}],
+                    "operation": "sum",
+                    "reason": "The requested total is derived by summing amount.",
+                    "requirement_ids": ["output_revenue"],
+                    "evidence_refs": [],
+                    "status": "confirmed",
+                },
+                {
+                    "name": "revenue",
+                    "kind": "semantic",
+                    "source_fields": [{"path": "knowledge.md", "table": None, "field": None}],
+                    "operation": None,
+                    "reason": "Knowledge defines the business meaning of revenue.",
+                    "requirement_ids": ["output_revenue"],
+                    "evidence_refs": ["knowledge:1"],
+                    "status": "confirmed",
+                },
+            ],
+            "helper_fields": [
+                {
+                    "source": {
+                        "path": "sales.csv",
+                        "table": None,
+                        "field": "customer_id",
+                    },
+                    "role": "filter",
+                    "reason": "Use only to select customers.",
+                    "requirement_ids": ["measure_revenue"],
+                }
+            ],
+        }
+    )
+    model = ScriptedModelAdapter([_response("report", payload, "report")])
+
+    result = ExplorerRunner(model=model, config=ExplorerConfig()).run(task, ExploreInput())
+
+    projection = result.report["answer_projection"]
+    assert [item["status"] for item in projection["columns"]] == [
+        "confirmed",
+        "confirmed",
+        "confirmed",
+    ]
+    assert projection["columns"][1]["operation"] == "sum"
+    assert projection["columns"][2]["evidence_refs"] == ["knowledge:1"]
+    assert projection["helper_fields"][0]["role"] == "filter"
+    assert projection["enforceable"] is True
+
+
+def test_answer_projection_downgrades_invented_sources_instead_of_confirming_them(tmp_path):
+    task = _task(tmp_path)
+    payload = _report_payload(
+        answer_projection={
+            "columns": [
+                {
+                    "name": "invented_total",
+                    "kind": "derived",
+                    "source_fields": [
+                        {
+                            "path": "sales.csv",
+                            "table": None,
+                            "field": "missing_amount",
+                        }
+                    ],
+                    "operation": "sum",
+                    "reason": "Unsupported model guess.",
+                    "requirement_ids": ["output_revenue"],
+                    "evidence_refs": [],
+                    "status": "confirmed",
+                }
+            ],
+            "helper_fields": [
+                {
+                    "source": {
+                        "path": "missing.csv",
+                        "table": None,
+                        "field": "customer_id",
+                    },
+                    "role": "join",
+                    "reason": "Unsupported helper guess.",
+                    "requirement_ids": ["measure_revenue"],
+                }
+            ],
+        }
+    )
+    model = ScriptedModelAdapter([_response("report", payload, "report")])
+
+    result = ExplorerRunner(model=model, config=ExplorerConfig()).run(task, ExploreInput())
+
+    projection = result.report["answer_projection"]
+    assert projection["columns"][0]["source_fields"] == []
+    assert projection["columns"][0]["status"] == "candidate"
+    assert projection["helper_fields"] == []
+    assert projection["enforceable"] is False
+    codes = {item["code"] for item in result.report["warnings"]}
+    assert {
+        "UNKNOWN_OUTPUT_SOURCE_DROPPED",
+        "OUTPUT_COLUMN_DOWNGRADED",
+        "UNKNOWN_HELPER_FIELD_DROPPED",
+    } <= codes
 
 
 def test_inventory_is_injected_before_first_model_request(tmp_path):
@@ -557,6 +715,133 @@ def test_main_agent_calls_explore_once_then_restores_normal_tools(tmp_path):
     assert model.requested_tool_names[0] == ("explore",)
     assert "explore" not in model.requested_tool_names[2]
     assert model.requests[2][-1].tool_call_id == "main_explore"
+
+
+def test_confirmed_answer_projection_rejects_wrong_column_count_then_allows_correction(
+    tmp_path,
+):
+    task = _task(tmp_path)
+    model = ScriptedModelAdapter(
+        [
+            _response("explore", {}, "main_explore"),
+            _response("report", _report_payload(), "report"),
+            _response(
+                "answer",
+                {
+                    "columns": ["customer_id", "amount"],
+                    "rows": [["C1", "10"]],
+                },
+                "extra_answer",
+            ),
+            _response(
+                "answer",
+                {"columns": ["revenue"], "rows": [["10"]]},
+                "corrected_answer",
+            ),
+        ]
+    )
+    events = []
+    base_registry = create_default_tool_registry()
+    specs = dict(base_registry.specs)
+    specs["explore"] = create_explorer_tool_spec(
+        model=model,
+        config=ExplorerConfig(),
+        event_sink=lambda kind, payload: events.append((kind, payload)),
+    )
+    agent = ReActAgent(
+        model=model,
+        tools=ToolRegistry(specs=specs),
+        event_sink=lambda kind, payload: events.append((kind, payload)),
+    )
+
+    result = agent.run(task)
+
+    assert result.succeeded is True
+    assert [step.action for step in result.steps] == ["explore", "answer", "answer"]
+    error = result.steps[1].observation["content"]["error"]
+    assert error["code"] == "OUTPUT_COLUMN_MISMATCH"
+    assert error["expected_outputs"] == ["revenue"]
+    assert error["helper_fields_to_omit"] == ["customer_id"]
+    assert result.answer is not None
+    assert result.answer.columns == ["revenue"]
+    assert sum(kind == "answer_projection_rejected" for kind, _ in events) == 1
+
+
+def test_candidate_answer_projection_does_not_reject_final_answer(tmp_path):
+    task = _task(tmp_path)
+    payload = _report_payload()
+    payload["answer_projection"]["columns"][0]["status"] = "candidate"
+    model = ScriptedModelAdapter(
+        [
+            _response("explore", {}, "main_explore"),
+            _response("report", payload, "report"),
+            _response(
+                "answer",
+                {
+                    "columns": ["customer_id", "amount"],
+                    "rows": [["C1", "10"]],
+                },
+                "candidate_answer",
+            ),
+        ]
+    )
+    base_registry = create_default_tool_registry()
+    specs = dict(base_registry.specs)
+    specs["explore"] = create_explorer_tool_spec(
+        model=model,
+        config=ExplorerConfig(),
+    )
+    agent = ReActAgent(model=model, tools=ToolRegistry(specs=specs))
+
+    result = agent.run(task)
+
+    assert result.succeeded is True
+    assert [step.action for step in result.steps] == ["explore", "answer"]
+    assert result.answer is not None
+    assert result.answer.columns == ["customer_id", "amount"]
+
+
+def test_incomplete_confirmed_projection_does_not_reject_final_answer(tmp_path):
+    task = _task(tmp_path)
+    payload = _report_payload()
+    payload["task_requirements"].append(
+        {
+            "id": "output_customer",
+            "kind": "output",
+            "description": "Return the customer identifier.",
+            "status": "resolved",
+        }
+    )
+    model = ScriptedModelAdapter(
+        [
+            _response("explore", {}, "main_explore"),
+            _response("report", payload, "report"),
+            _response(
+                "answer",
+                {
+                    "columns": ["customer_id", "amount"],
+                    "rows": [["C1", "10"]],
+                },
+                "incomplete_projection_answer",
+            ),
+        ]
+    )
+    base_registry = create_default_tool_registry()
+    specs = dict(base_registry.specs)
+    specs["explore"] = create_explorer_tool_spec(
+        model=model,
+        config=ExplorerConfig(),
+    )
+    agent = ReActAgent(model=model, tools=ToolRegistry(specs=specs))
+
+    result = agent.run(task)
+
+    assert result.succeeded is True
+    projection = result.steps[0].observation["content"]["report"]["answer_projection"]
+    assert projection["enforceable"] is False
+    assert [step.action for step in result.steps] == ["explore", "answer"]
+    assert result.answer is not None
+    assert result.answer.columns == ["customer_id", "amount"]
 
 
 def test_runner_forces_first_explore_and_records_deterministic_inventory(tmp_path):
