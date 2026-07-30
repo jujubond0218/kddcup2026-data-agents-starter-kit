@@ -32,10 +32,16 @@ def build_system_prompt(
             "\n7. Your first tool call must be `explore({})`. It launches a discovery-only "
             "sub-agent and is available for exactly one call.\n"
             "8. Use its task_requirements, recommended_sources, source-anchored knowledge "
-            "rules, schemas, and value samples as a compact reference guide. Prioritize "
-            "confirmed sources, independently check candidate sources and uncertainties with "
-            "normal tools, treat joins and ETL entries as advisory, and prefer actual queried "
-            "data on conflict."
+            "rules, answer_projection, schemas, and value samples as a compact reference "
+            "guide. Prioritize confirmed sources, independently check candidate sources and "
+            "uncertainties with normal tools, treat joins and ETL entries as advisory, and "
+            "prefer actual queried data on conflict. Treat answer_projection.columns as a "
+            "hard expected shape only when answer_projection.enforceable is true. Otherwise "
+            "cross-check output task_requirements and uncertainties for omitted or candidate "
+            "outputs before submitting the resolved minimal projection. Keep direct/semantic columns separate "
+            "unless an anchored rule requires a transformation; derived columns may use the "
+            "declared operation. Never output answer_projection.helper_fields used only for "
+            "filtering, joining, sorting, or grouping."
         )
     return prompt
 

@@ -222,8 +222,14 @@ schemas remain unchanged.
 before the first Explorer request and covers CSV/TSV, JSON, SQLite, Markdown, text, and text-based
 PDF inputs. `knowledge.md` uses a separate budget to select the question-relevant section, which
 is preserved under `knowledge.source_evidence`. The first request produces
-`task_requirements`, `recommended_sources`, `knowledge.applicable_rules`, candidate
-`join_paths`, and `uncertainties`. If one follow-up is needed, tool schemas enumerate only real
+`task_requirements`, `answer_projection`, `recommended_sources`, `knowledge.applicable_rules`,
+candidate `join_paths`, and `uncertainties`. The answer projection separates direct fields,
+derived outputs with real inputs and an operation, document-semantic outputs, and helper fields
+used only for filtering, joining, sorting, or grouping. The runtime drops invented sources and
+downgrades unsupported confirmed outputs to `candidate`. Only an entirely confirmed projection
+that covers every resolved output requirement and links every column to one sets `enforceable=true`
+and enables a final answer column-count correction. Column labels need not match physical fields;
+incomplete or candidate projections never block submission. If one follow-up is needed, tool schemas enumerate only real
 Inventory paths; SQL is absent without SQLite, and the second request exposes only `report`.
 The runtime merges the complete file list and schemas, validates path/field/evidence references,
 and ignores malformed semantic items individually. If follow-up arguments fail validation, the

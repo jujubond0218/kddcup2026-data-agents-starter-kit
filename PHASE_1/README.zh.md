@@ -217,8 +217,13 @@ Inventory 无法判断关键来源或字段时，才允许一次定向补查，�
 `explore` 不再把 `inspect_files` 暴露给模型：确定性 Inventory 在首个 Explorer 请求前
 完成，覆盖 CSV/TSV、JSON、SQLite、Markdown、文本和文本型 PDF；`knowledge.md` 使用
 独立预算选择与题目最相关的章节，并以 `knowledge.source_evidence` 进入最终说明书。
-首个请求同时生成 `task_requirements`、`recommended_sources`、
-`knowledge.applicable_rules`、候选 `join_paths` 和 `uncertainties`。如果必须补证，
+首个请求同时生成 `task_requirements`、`answer_projection`、`recommended_sources`、
+`knowledge.applicable_rules`、候选 `join_paths` 和 `uncertainties`。答案投影区分直接
+字段、带真实来源与运算的派生字段、文档语义字段，以及只用于过滤/连接/排序/分组的
+helper 字段；运行时过滤虚构来源并将证据不足的输出降级为 `candidate`。只有投影中的
+答案列全部 confirmed、覆盖全部 resolved output 需求且每列都引用 output 需求时，
+`answer_projection.enforceable` 才为 true，`answer` 才会按列数拒绝合并列或额外辅助列；
+不会要求答案列名必须等于物理字段名，漏项或 candidate 投影也不会阻断提交。如果必须补证，
 注册表只暴露 Inventory 中真实路径；没有 SQLite 时不暴露 SQL，第二次请求只暴露
 `report`。运行时合并全文件清单与 schema、校验路径/字段/evidence 引用并逐项忽略非法
 语义项。补查参数失败、工具失败或返回空证据时，运行时会强制添加 unresolved 需求和

@@ -29,6 +29,8 @@ SQLite、Markdown、文本和文本型 PDF，返回真实相对路径、格式�
 
 - `task_interpretation`：整体任务和预期输出形状的简要解释；
 - `task_requirements`：最多 12 项实体、指标、过滤、时间、输出、knowledge 或连接需求；
+- `answer_projection`：题目要求的最小答案列，以及只用于过滤、连接、排序或分组的
+  helper 字段；
 - `recommended_sources`：真实文件、可选表、候选字段、用途、理由、需求引用，以及
   `confirmed` / `candidate` 状态；
 - `knowledge.applicable_rules`、候选 `join_paths`、`value_samples`、
@@ -39,6 +41,15 @@ SQLite、Markdown、文本和文本型 PDF，返回真实相对路径、格式�
 `files/schema_map` 与 knowledge 原文证据始终由运行时合并，模型不能用不完整清单覆盖
 它们。无法确认的语义必须以 uncertainty 和可执行核验提示交给主 Agent，不能伪装成
 confirmed。
+
+`answer_projection.columns` 将答案列分为 `direct`、`derived` 和 `semantic`。直接列
+必须锚定 Inventory 中的真实 schema 字段；派生列可以没有同名物理字段，但必须声明真实
+来源和 `SUM`、`COUNT`、`AVG` 等运算；叙事文档中的语义列必须引用真实文件或 evidence。
+运行时丢弃虚构路径/字段，并把证据不足却声明为 confirmed 的列降级为 candidate。只有
+所有 `kind=output` 需求均 resolved 且被覆盖、每个投影列都引用 output 需求、所有答案列
+均 confirmed 时，投影才标记为 `enforceable`，主 Agent 才按列数执行确定性检查。列名
+本身不受限制；漏项、candidate 或仅引用 measure/filter 的投影不会阻断答案。这样既允许
+合法派生指标，也避免 Explorer 漏列或把排序指标误作输出时反向锁死主 Agent。
 
 ## 一次补查、停止与 fail-open
 
@@ -81,6 +92,50 @@ Explorer 仍出现 14 次参数校验错误和 1 次非法参数 JSON，说明�
 模型请求、约 435.7 万 Token。该次总分高于本文旧记录中的 0.5703，但 Runner 成功数由
 旧记录的 40 降为 38，且 worker 数、实现和真实服务波动均可能影响结果。因此这是一条
 当前配置下的单轮实证记录，不足以证明 Explorer 对语义准确率具有稳定因果提升。
+
+## 答案投影四题验证
+
+2026-07-30 使用本地目标配置、2 个 Runner worker 对此前出现输出形状问题的
+`task_27`、`task_180`、`task_259`、`task_355` 运行一次最终代码验证。Runner 成功
+3/4，`task_180` 触发 120 秒任务硬超时；其余三题均生成预测并满分。`task_27` 输出
+`first_name`、`last_name` 和派生总成本，`task_259` 只输出评论文本，`task_355` 输出
+分离的两个姓名字段和成本。
+
+本轮同时验证了 fail-open 边界：`task_259` 的单列投影覆盖全部 output 需求，因此
+`enforceable=true`；`task_355` 的姓名字段来自叙事文档、仍为 candidate，因此
+`enforceable=false`，主 Agent 可以核验后提交，不会被列数门禁错误拒绝。`task_180`
+的 Explorer 仍把 CustomerID 与 Consumption 同时列为候选答案，且任务因工程超时没有
+形成最终预测，仍属于未解决 bad case。该结果只是当前配置的一次四题 smoke，不能证明
+对完整 50 题的稳定提分。
+
+## 答案投影 50 题实验
+
+2026-07-30 使用最终代码、`max_workers=4`、20 步主 Agent 和 120 秒任务硬超时完成
+一次 50 题全量运行，run ID 为 `20260730T092318Z`。实际墙钟时间为 833.506 秒，
+任务耗时中位数为 45.069 秒，P95 为 120.301 秒。Runner 成功 39/50；评分为
+**0.6047**，31/50 题取得非零分，其中 29 题满分、2 题部分匹配、8 题无匹配、11 题
+缺失预测。
+
+相比前一次同为并发 4 的单轮实验 `20260730T021213Z`（评分 0.6888、Runner 成功
+40/50），本轮有 7 个旧满分任务退化为 0：`task_22`、`task_24`、`task_86`、
+`task_196`、`task_199`、`task_250`、`task_257`；同时 `task_19`、`task_25`、
+`task_27`、`task_259` 取得提升。净原始分减少 4.2083，对应总分降低约 0.0842。
+其中 4 个退化任务是缺失预测，另外 3 个虽然输出列数正确，但答案值无匹配。单轮真实
+服务存在执行路线和耗时波动，因此这组差异不能单独归因于答案投影。
+
+Explorer 最终为 50/50 题生成报告，但只有 42 题在主 Agent 第一步正确调用
+`explore`；其余任务先出现非法或未知工具调用，再恢复到 Explorer。3 题第一轮直接
+报告，47 题使用补查，3 题使用 fallback，只有 11 题的 `answer_projection` 满足
+`enforceable=true`。四个目标任务本轮分别为 `task_27=1.0`、`task_180=0.95`、
+`task_259=1.0`、`task_355=0.2833`：投影解决了其中两题，但 CustomerID 误投影和
+fallback 后缺少有效投影仍未解决。
+
+随后将全量运行的 11 个 Runner 失败任务单独重跑，run ID 为
+`20260730T094622Z`。`task_22` 与 `task_250` 恢复并满分；`task_11`、`task_24`、
+`task_38`、`task_257`、`task_418` 再次硬超时，`task_80`、`task_344`、
+`task_396`、`task_420` 仍未在 20 步内提交答案。该重跑说明部分缺失来自运行波动，
+但 Python 子进程不返回和主 Agent 重复调用工具等问题可以复现，不属于本 PR 的答案
+投影范围。
 
 ## 历史实验
 

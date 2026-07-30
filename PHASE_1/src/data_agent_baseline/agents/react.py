@@ -188,10 +188,52 @@ class ReActAgent:
         call: ModelToolCall,
         tool_result: ToolExecutionResult,
         step_index: int,
+        answer_projection: dict[str, object] | None,
     ) -> ToolExecutionResult:
         answer = tool_result.answer
         if answer is None:
             return tool_result
+
+        projection_columns = self._confirmed_projection_columns(answer_projection)
+        if projection_columns is not None and len(answer.columns) != len(projection_columns):
+            output_names = [str(item.get("name", "")) for item in projection_columns]
+            helper_fields = self._helper_field_labels(answer_projection)
+            emit_event(
+                self.event_sink,
+                "answer_projection_rejected",
+                {
+                    "step_index": step_index,
+                    "tool_call_id": call.id,
+                    "submitted_column_count": len(answer.columns),
+                    "expected_column_count": len(projection_columns),
+                },
+            )
+            return ToolExecutionResult(
+                ok=False,
+                content={
+                    "error": {
+                        "code": "OUTPUT_COLUMN_MISMATCH",
+                        "message": (
+                            f"The submitted table has {len(answer.columns)} columns, but the "
+                            f"confirmed Explorer answer projection has {len(projection_columns)}."
+                        ),
+                        "expected_outputs": output_names,
+                        "helper_fields_to_omit": helper_fields,
+                        "guidance": (
+                            "Submit one column per confirmed output projection. Do not merge "
+                            "separate direct/semantic outputs, and omit fields used only for "
+                            "filtering, joining, sorting, or grouping. Column labels may be "
+                            "descriptive; derived outputs are allowed when backed by the "
+                            "declared sources and operation."
+                        ),
+                        "recoverable": True,
+                        "do_not_retry_same_call": True,
+                    }
+                },
+                action_input=tool_result.action_input,
+                error_code="OUTPUT_COLUMN_MISMATCH",
+                recoverable=True,
+            )
 
         failure = self.answer_verifier.verify(answer)
         if failure is None:
@@ -232,11 +274,51 @@ class ReActAgent:
             recoverable=True,
         )
 
+    @staticmethod
+    def _confirmed_projection_columns(
+        answer_projection: dict[str, object] | None,
+    ) -> list[dict[str, object]] | None:
+        if not isinstance(answer_projection, dict):
+            return None
+        if answer_projection.get("enforceable") is not True:
+            return None
+        raw_columns = answer_projection.get("columns")
+        if not isinstance(raw_columns, list) or not raw_columns:
+            return None
+        columns = [item for item in raw_columns if isinstance(item, dict)]
+        if len(columns) != len(raw_columns):
+            return None
+        if any(item.get("status") != "confirmed" for item in columns):
+            return None
+        return columns
+
+    @staticmethod
+    def _helper_field_labels(
+        answer_projection: dict[str, object] | None,
+    ) -> list[str]:
+        if not isinstance(answer_projection, dict):
+            return []
+        raw_helpers = answer_projection.get("helper_fields")
+        if not isinstance(raw_helpers, list):
+            return []
+        labels: list[str] = []
+        for item in raw_helpers:
+            if not isinstance(item, dict):
+                continue
+            source = item.get("source")
+            if not isinstance(source, dict):
+                continue
+            field = source.get("field")
+            if isinstance(field, str) and field:
+                labels.append(field)
+        return list(dict.fromkeys(labels))
+
     def run(self, task: PublicTask) -> AgentRunResult:
         state = AgentRuntimeState()
         messages = self._initial_messages(task)
         exploration_required = self._exploration_required()
         exploration_pending = exploration_required
+        answer_projection: dict[str, object] | None = None
 
         for step_index in range(1, self.config.max_steps + 1):
             emit_event(
@@ -307,11 +389,17 @@ class ReActAgent:
             tool_result = active_tools.execute(task, call)
             if exploration_pending and call.name == "explore":
                 exploration_pending = False
+                report = tool_result.content.get("report")
+                if isinstance(report, dict):
+                    raw_projection = report.get("answer_projection")
+                    if isinstance(raw_projection, dict):
+                        answer_projection = raw_projection
             if tool_result.is_terminal:
                 tool_result = self._verify_terminal_answer(
                     call=call,
                     tool_result=tool_result,
                     step_index=step_index,
+                    answer_projection=answer_projection,
                 )
             tool_event_payload = {
                 "step_index": step_index,
