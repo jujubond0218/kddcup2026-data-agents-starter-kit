@@ -28,6 +28,8 @@ from data_agent_baseline.tools.python_exec import execute_python_code
 from data_agent_baseline.tools.sqlite import execute_read_only_sql, inspect_sqlite_schema
 
 EXECUTE_PYTHON_TIMEOUT_SECONDS = 30
+SQLITE_HEADER = b"SQLite format 3\x00"
+SQLITE_TOOL_NAMES = frozenset({"execute_context_sql", "inspect_sqlite_schema"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,16 +146,24 @@ def _tool_error(
     code: str,
     message: str,
     action_input: dict[str, Any] | None = None,
+    guidance: str | None = None,
+    suggested_tools: list[str] | None = None,
+    do_not_retry_same_call: bool = False,
 ) -> ToolExecutionResult:
+    error: dict[str, Any] = {
+        "code": code,
+        "message": message,
+        "recoverable": True,
+    }
+    if guidance is not None:
+        error["guidance"] = guidance
+    if suggested_tools:
+        error["suggested_tools"] = suggested_tools
+    if do_not_retry_same_call:
+        error["do_not_retry_same_call"] = True
     return ToolExecutionResult(
         ok=False,
-        content={
-            "error": {
-                "code": code,
-                "message": message,
-                "recoverable": True,
-            }
-        },
+        content={"error": error},
         action_input=action_input,
         error_code=code,
         recoverable=True,
@@ -166,6 +176,73 @@ def _validation_message(tool_name: str, error: ValidationError) -> str:
         location = ".".join(str(part) for part in item.get("loc", ())) or "<root>"
         details.append(f"{location}: {item['msg']}")
     return f"{tool_name} arguments are invalid: {'; '.join(details)}"
+
+
+def _suggested_reader(path: str) -> str:
+    suffix = path.rsplit(".", 1)[-1].casefold() if "." in path else ""
+    if suffix in {"csv", "tsv"}:
+        return "read_csv"
+    if suffix == "json":
+        return "read_json"
+    if suffix in {"md", "markdown", "txt", "pdf"}:
+        return "read_doc"
+    return "execute_python"
+
+
+def _is_non_sqlite_target(
+    task: PublicTask,
+    action_input: dict[str, Any],
+) -> bool:
+    raw_path = action_input.get("path")
+    if not isinstance(raw_path, str) or not raw_path:
+        return False
+    try:
+        path = resolve_context_path(task, raw_path)
+        with path.open("rb") as stream:
+            return stream.read(len(SQLITE_HEADER)) != SQLITE_HEADER
+    except (OSError, ValueError):
+        return False
+
+
+def _execution_error(
+    *,
+    task: PublicTask,
+    tool_name: str,
+    action_input: dict[str, Any],
+    exception: Exception,
+) -> ToolExecutionResult:
+    if isinstance(exception, FileNotFoundError):
+        return _tool_error(
+            code="PATH_NOT_FOUND",
+            message=f"{tool_name} could not find the requested path inside task context.",
+            guidance=(
+                "Do not guess or retry the same path. Call list_context, or reuse an exact "
+                "path from the earlier explore report's files/recommended_sources."
+            ),
+            suggested_tools=["list_context"],
+            do_not_retry_same_call=True,
+            action_input=action_input,
+        )
+    if tool_name in SQLITE_TOOL_NAMES and _is_non_sqlite_target(task, action_input):
+        raw_path = action_input.get("path")
+        suggested_tool = _suggested_reader(str(raw_path))
+        return _tool_error(
+            code="NOT_SQLITE",
+            message=f"{tool_name} only accepts SQLite database files; this path is not SQLite.",
+            guidance=(
+                f"Do not retry a SQLite tool on this path. Use {suggested_tool} for this "
+                "file type, or reuse the file kind and recommended source from the earlier "
+                "explore report."
+            ),
+            suggested_tools=[suggested_tool],
+            do_not_retry_same_call=True,
+            action_input=action_input,
+        )
+    return _tool_error(
+        code="TOOL_EXECUTION_ERROR",
+        message=f"{tool_name} failed: {type(exception).__name__}: {exception}",
+        action_input=action_input,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,10 +290,11 @@ class ToolRegistry:
         try:
             result = spec.handler(task, validated)
         except Exception as exc:
-            return _tool_error(
-                code="TOOL_EXECUTION_ERROR",
-                message=f"{call.name} failed: {type(exc).__name__}: {exc}",
+            return _execution_error(
+                task=task,
+                tool_name=call.name,
                 action_input=normalized_input,
+                exception=exc,
             )
         return ToolExecutionResult(
             ok=result.ok,

@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import subprocess
 import sys
 
@@ -188,3 +189,101 @@ def test_converts_handler_exceptions_to_recoverable_results(tmp_path):
     assert result.error_code == "TOOL_EXECUTION_ERROR"
     assert result.recoverable is True
     assert "OSError" in result.content["error"]["message"]
+
+
+def test_non_sqlite_sql_error_guides_agent_to_matching_reader(tmp_path):
+    task = _task(tmp_path)
+    (task.context_dir / "sales.csv").write_text("customer_id,amount\nC1,10\n")
+
+    result = create_default_tool_registry().execute(
+        task,
+        _call(
+            "execute_context_sql",
+            json.dumps(
+                {
+                    "path": "sales.csv",
+                    "sql": "SELECT * FROM sales",
+                }
+            ),
+        ),
+    )
+
+    assert result.error_code == "NOT_SQLITE"
+    assert result.action_input == {
+        "path": "sales.csv",
+        "sql": "SELECT * FROM sales",
+        "limit": 200,
+    }
+    assert result.content["error"] == {
+        "code": "NOT_SQLITE",
+        "message": (
+            "execute_context_sql only accepts SQLite database files; this path is not SQLite."
+        ),
+        "recoverable": True,
+        "guidance": (
+            "Do not retry a SQLite tool on this path. Use read_csv for this file type, "
+            "or reuse the file kind and recommended source from the earlier explore report."
+        ),
+        "suggested_tools": ["read_csv"],
+        "do_not_retry_same_call": True,
+    }
+
+
+def test_missing_path_error_guides_agent_to_context_inventory(tmp_path):
+    task = _task(tmp_path)
+
+    result = create_default_tool_registry().execute(
+        task,
+        _call("read_json", '{"path":"invented.json"}'),
+    )
+
+    assert result.error_code == "PATH_NOT_FOUND"
+    assert result.content["error"]["suggested_tools"] == ["list_context"]
+    assert result.content["error"]["do_not_retry_same_call"] is True
+    assert "Do not guess or retry the same path" in result.content["error"]["guidance"]
+    assert "explore report" in result.content["error"]["guidance"]
+
+
+def test_sql_syntax_error_on_real_sqlite_remains_execution_error(tmp_path):
+    task = _task(tmp_path)
+    with sqlite3.connect(task.context_dir / "facts.db") as connection:
+        connection.execute("CREATE TABLE facts (value INTEGER)")
+
+    result = create_default_tool_registry().execute(
+        task,
+        _call(
+            "execute_context_sql",
+            json.dumps(
+                {
+                    "path": "facts.db",
+                    "sql": "SELECT FROM facts",
+                }
+            ),
+        ),
+    )
+
+    assert result.error_code == "TOOL_EXECUTION_ERROR"
+    assert result.content["error"].get("do_not_retry_same_call") is None
+    assert "OperationalError" in result.content["error"]["message"]
+
+
+def test_sql_path_escape_remains_a_recoverable_execution_error(tmp_path):
+    task = _task(tmp_path)
+
+    result = create_default_tool_registry().execute(
+        task,
+        _call(
+            "execute_context_sql",
+            json.dumps(
+                {
+                    "path": "../outside.db",
+                    "sql": "SELECT 1",
+                }
+            ),
+        ),
+    )
+
+    assert result.error_code == "TOOL_EXECUTION_ERROR"
+    assert result.recoverable is True
+    assert result.content["error"].get("do_not_retry_same_call") is None
+    assert "Path escapes context dir" in result.content["error"]["message"]

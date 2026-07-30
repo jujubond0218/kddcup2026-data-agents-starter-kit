@@ -213,6 +213,11 @@ The baseline exposes these tools to the model:
 | `answer` | Submit the final answer table and terminate the task. | `columns`, `rows` |
 
 All file paths passed to tools must be relative to the task `context/` directory.
+Recoverable file errors from the main tools include structured correction guidance:
+`PATH_NOT_FOUND` directs the model to `list_context` or an exact path from the Explorer report,
+while `NOT_SQLITE` recommends the reader matching a non-SQLite file. Both mark
+`do_not_retry_same_call` so the next turn can correct directly; tool availability and input
+schemas remain unchanged.
 `explore` no longer advertises `inspect_files` to the model. Deterministic Inventory is completed
 before the first Explorer request and covers CSV/TSV, JSON, SQLite, Markdown, text, and text-based
 PDF inputs. `knowledge.md` uses a separate budget to select the question-relevant section, which

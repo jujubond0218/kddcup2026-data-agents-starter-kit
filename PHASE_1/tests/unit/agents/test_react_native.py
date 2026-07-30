@@ -118,6 +118,43 @@ def test_returns_validation_error_to_model_and_allows_correction(tmp_path):
     assert tool_failure["tool_call_id"] == "call_invalid"
 
 
+def test_non_sqlite_observation_reaches_next_turn_with_correction_guidance(tmp_path):
+    model = ScriptedModelAdapter(
+        [
+            _tool_response(
+                "execute_context_sql",
+                {"path": "data.csv", "sql": "SELECT * FROM data"},
+                call_id="call_wrong_sql",
+            ),
+            _tool_response(
+                "read_csv",
+                {"path": "data.csv"},
+                call_id="call_correct_reader",
+            ),
+            _answer_response(),
+        ]
+    )
+    agent = ReActAgent(
+        model=model,
+        tools=create_default_tool_registry(),
+    )
+
+    result = agent.run(_task(tmp_path))
+
+    assert result.succeeded is True
+    assert [step.action for step in result.steps] == [
+        "execute_context_sql",
+        "read_csv",
+        "answer",
+    ]
+    assert result.steps[0].observation["content"]["error"]["code"] == "NOT_SQLITE"
+    second_request_observation = json.loads(model.requests[1][-1].content)
+    error = second_request_observation["content"]["error"]
+    assert error["do_not_retry_same_call"] is True
+    assert error["suggested_tools"] == ["read_csv"]
+    assert "explore report" in error["guidance"]
+
+
 def test_empty_tool_call_is_recorded_and_corrected_with_user_message(tmp_path):
     empty_response = ModelResponse(
         content="I will answer in text.",

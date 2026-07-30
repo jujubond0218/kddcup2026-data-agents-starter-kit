@@ -210,6 +210,10 @@ Inventory 无法判断关键来源或字段时，才允许一次定向补查，�
 | `answer` | 提交最终答案表格并结束当前任务。 | `columns`、`rows` |
 
 所有文件路径都必须是相对于任务 `context/` 目录的相对路径。
+主工具的可恢复文件错误会返回结构化纠错信息：路径不存在使用 `PATH_NOT_FOUND`，提示
+调用 `list_context` 或复用 Explorer 报告中的精确路径；SQL/schema 工具收到非 SQLite
+文件时使用 `NOT_SQLITE`，并根据文件类型建议对应读取工具。两类错误都标记
+`do_not_retry_same_call`，用于引导下一轮直接纠正；工具可见性和输入 schema 不变。
 `explore` 不再把 `inspect_files` 暴露给模型：确定性 Inventory 在首个 Explorer 请求前
 完成，覆盖 CSV/TSV、JSON、SQLite、Markdown、文本和文本型 PDF；`knowledge.md` 使用
 独立预算选择与题目最相关的章节，并以 `knowledge.source_evidence` 进入最终说明书。
