@@ -26,6 +26,40 @@ class ReActAgentConfig:
     max_steps: int = 16
 
 
+def _step_budget_reminder(
+    *,
+    used_steps: int,
+    max_steps: int,
+    warning_fired: bool,
+    critical_fired: bool,
+) -> tuple[str, str] | None:
+    if max_steps <= 0:
+        return None
+
+    ratio = used_steps / max_steps
+    remaining_steps = max_steps - used_steps
+    if ratio >= 0.90 and not critical_fired:
+        return (
+            "critical",
+            (
+                f"STEP BUDGET CRITICAL: {used_steps}/{max_steps} normal steps used; "
+                f"{remaining_steps} remain. Prioritize submitting the best evidence-backed "
+                "table with `answer`. Do not start broad new exploration."
+            ),
+        )
+    if ratio >= 0.70 and not warning_fired:
+        return (
+            "warning",
+            (
+                f"STEP BUDGET WARNING: {used_steps}/{max_steps} normal steps used; "
+                f"{remaining_steps} remain. If the observed evidence already supports a "
+                "final table, call `answer` now. Otherwise perform only the highest-value "
+                "remaining check, avoid repeating completed work, and converge."
+            ),
+        )
+    return None
+
+
 def _assistant_message(response: ModelResponse) -> ModelMessage:
     return ModelMessage(
         role="assistant",
@@ -50,6 +84,30 @@ def _protocol_error_observation(code: str, message: str) -> dict[str, object]:
                 "code": code,
                 "message": message,
                 "recoverable": True,
+            }
+        },
+    }
+
+
+def _final_step_guard_observation(tool_name: str) -> dict[str, object]:
+    return {
+        "ok": False,
+        "tool": tool_name,
+        "content": {
+            "error": {
+                "code": "FINAL_STEP_REQUIRES_ANSWER",
+                "message": (
+                    "The last normal step is reserved for submitting the final answer. "
+                    f"The requested non-terminal tool `{tool_name}` was not executed."
+                ),
+                "guidance": (
+                    "Call `answer` now using the strongest evidence already obtained. "
+                    "Do not call another analysis tool."
+                ),
+                "required_tool": "answer",
+                "remaining_normal_steps": 0,
+                "recoverable": True,
+                "do_not_retry_same_call": True,
             }
         },
     }
@@ -319,24 +377,64 @@ class ReActAgent:
         exploration_required = self._exploration_required()
         exploration_pending = exploration_required
         answer_projection: dict[str, object] | None = None
+        budget_warning_fired = False
+        budget_critical_fired = False
+        finalization_retry_pending = False
+        step_index = 1
 
-        for step_index in range(1, self.config.max_steps + 1):
+        while step_index <= self.config.max_steps or finalization_retry_pending:
+            finalization_retry = step_index > self.config.max_steps
+            if finalization_retry:
+                finalization_retry_pending = False
             emit_event(
                 self.event_sink,
                 "step_started",
-                {"step_index": step_index},
+                {
+                    "step_index": step_index,
+                    **({"finalization_retry": True} if finalization_retry else {}),
+                },
             )
-            active_tools = self._active_tools(
-                exploration_pending=exploration_pending,
-                exploration_required=exploration_required,
-            )
+            if finalization_retry:
+                active_tools = ToolRegistry(specs={"answer": self.tools.specs["answer"]})
+            else:
+                reminder = _step_budget_reminder(
+                    used_steps=step_index - 1,
+                    max_steps=self.config.max_steps,
+                    warning_fired=budget_warning_fired,
+                    critical_fired=budget_critical_fired,
+                )
+                if reminder is not None:
+                    level, content = reminder
+                    messages.append(ModelMessage(role="user", content=content))
+                    if level == "warning":
+                        budget_warning_fired = True
+                    else:
+                        budget_critical_fired = True
+                    emit_event(
+                        self.event_sink,
+                        "step_budget_warning",
+                        {
+                            "step_index": step_index,
+                            "level": level,
+                            "used_steps": step_index - 1,
+                            "remaining_steps": self.config.max_steps - step_index + 1,
+                            "max_steps": self.config.max_steps,
+                        },
+                    )
+                active_tools = self._active_tools(
+                    exploration_pending=exploration_pending,
+                    exploration_required=exploration_required,
+                )
+            request_context: dict[str, object] = {
+                "task_id": task.task_id,
+                "step_index": step_index,
+            }
+            if finalization_retry:
+                request_context["finalization_retry"] = True
             response = self.model.complete(
                 messages,
                 tools=active_tools,
-                request_context={
-                    "task_id": task.task_id,
-                    "step_index": step_index,
-                },
+                request_context=request_context,
             )
 
             if not response.tool_calls:
@@ -348,6 +446,9 @@ class ReActAgent:
                     code="NO_TOOL_CALL",
                     message="The model response did not contain a native tool call.",
                 )
+                if finalization_retry:
+                    break
+                step_index += 1
                 continue
             if len(response.tool_calls) != 1:
                 self._record_protocol_error(
@@ -361,6 +462,9 @@ class ReActAgent:
                         "tool per turn."
                     ),
                 )
+                if finalization_retry:
+                    break
+                step_index += 1
                 continue
 
             call = response.tool_calls[0]
@@ -373,9 +477,54 @@ class ReActAgent:
                     code="INVALID_TOOL_CALL",
                     message="A native tool call must include a non-empty id and function name.",
                 )
+                if finalization_retry:
+                    break
+                step_index += 1
                 continue
 
             messages.append(_assistant_message(response))
+            if (
+                not finalization_retry
+                and step_index == self.config.max_steps
+                and call.name != "answer"
+                and "answer" in active_tools.specs
+            ):
+                observation = _final_step_guard_observation(call.name)
+                messages.append(_tool_message(call, observation))
+                emit_event(
+                    self.event_sink,
+                    "final_step_guard_triggered",
+                    {
+                        "step_index": step_index,
+                        "tool_call_id": call.id,
+                        "blocked_tool": call.name,
+                        "retry_step_index": step_index + 1,
+                    },
+                )
+                step_record = StepRecord(
+                    step_index=step_index,
+                    thought=response.content,
+                    action=call.name,
+                    action_input={},
+                    raw_response=response.raw_response,
+                    observation=observation,
+                    ok=False,
+                    tool_call_id=call.id,
+                    finish_reason=response.finish_reason,
+                )
+                state.steps.append(step_record)
+                emit_event(
+                    self.event_sink,
+                    "step_completed",
+                    {
+                        "step_index": step_index,
+                        "step": step_record.to_dict(),
+                    },
+                )
+                finalization_retry_pending = True
+                step_index += 1
+                continue
+
             emit_event(
                 self.event_sink,
                 "tool_started",
@@ -455,6 +604,9 @@ class ReActAgent:
             if tool_result.is_terminal:
                 state.answer = tool_result.answer
                 break
+            if finalization_retry:
+                break
+            step_index += 1
 
         if state.answer is None and state.failure_reason is None:
             state.failure_reason = "Agent did not submit an answer within max_steps."

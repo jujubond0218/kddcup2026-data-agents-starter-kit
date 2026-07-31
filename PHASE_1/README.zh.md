@@ -168,6 +168,14 @@ uv run dabench run-benchmark \
   --task-file configs/explorer_bad_cases.example.txt
 ```
 
+将本地任务上限设为 300 秒后，运行固定的 7 题停止守卫样本集：
+
+```bash
+uv run dabench run-benchmark \
+  --config configs/react_baseline.local.yaml \
+  --task-file configs/stop_guard_bad_cases.example.txt
+```
+
 先把 `run.run_id` 设置为已有运行目录名，再恢复中断运行或只重试已经完成的失败任务：
 
 ```bash
@@ -194,6 +202,10 @@ Inventory 无法判断关键来源或字段时，才允许一次定向补查，�
 补查仍使用原始 call ID 接收 observation。
 `answer` 调用还必须通过确定性的 CSV 安全校验才能终止任务；被拒绝的候选答案会收到可恢复
 的工具观察，以便模型修正后重提。
+主 Agent 在正常步数使用达到 70% 和 90% 后会分别收到一次预算提醒。Explorer 已完成时，
+若最后一个正常步骤仍调用非终止工具，运行时不会执行该工具，而是使用原始 call ID 返回
+`FINAL_STEP_REQUIRES_ANSWER`，随后只开放 `answer` 并额外请求模型一次。该收尾请求不会
+继续产生重试，参数校验和答案 Verifier 仍复用现有链路。
 
 当前暴露给模型的工具有：
 
@@ -281,6 +293,8 @@ uv run dabench score-run artifacts/runs/<run_id> \
 [`docs/2026-07-24-answer-verification.md`](docs/2026-07-24-answer-verification.md)。
 受限 Explorer 的设计、预算、失败回退和评测边界见
 [`docs/2026-07-27-context-explorer.md`](docs/2026-07-27-context-explorer.md)。
+步数预算提醒、最终步骤守卫、Trace 语义和定向 bad case 实验方案见
+[`docs/2026-07-31-step-budget-stop-guard.md`](docs/2026-07-31-step-budget-stop-guard.md)。
 
 ## Contact
 
