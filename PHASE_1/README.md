@@ -168,6 +168,14 @@ uv run dabench run-benchmark \
   --task-file configs/explorer_bad_cases.example.txt
 ```
 
+Run the seven-task stop-guard selection after setting the local task timeout to 300 seconds:
+
+```bash
+uv run dabench run-benchmark \
+  --config configs/react_baseline.local.yaml \
+  --task-file configs/stop_guard_bad_cases.example.txt
+```
+
 Set `run.run_id` to the existing run directory name, then resume an interrupted run or
 retry only its completed failures:
 
@@ -195,6 +203,12 @@ cannot resolve a critical source or field may it make one targeted follow-up; th
 exposes `report` only, and the follow-up receives its observation under the original call ID.
 An `answer` call must also pass deterministic CSV-safety verification before it can terminate
 the task; rejected candidates receive a recoverable tool observation for correction.
+The main Agent receives one step-budget reminder after 70% of its normal steps and one critical
+reminder after 90%. If its final normal step calls a non-terminal tool after exploration has
+finished, that tool is not executed: the runtime returns `FINAL_STEP_REQUIRES_ANSWER` under the
+same call ID and allows one extra model request with only `answer` available. This finalization
+request cannot create another retry and still uses the existing argument validation and answer
+verification path.
 The same Chat Completions flow works with Alibaba Cloud Model Studio's OpenAI-compatible
 endpoint through the existing `agent.api_base` setting.
 
@@ -291,6 +305,9 @@ The deterministic pre-submit checks and correction flow are documented in
 [`docs/2026-07-24-answer-verification.md`](docs/2026-07-24-answer-verification.md).
 The bounded Explorer design, limits, fallback behavior, and evaluation boundaries are recorded in
 [`docs/2026-07-27-context-explorer.md`](docs/2026-07-27-context-explorer.md).
+The step-budget reminders, final-step guard, Trace behavior, and targeted bad-case protocol are
+documented in
+[`docs/2026-07-31-step-budget-stop-guard.md`](docs/2026-07-31-step-budget-stop-guard.md).
 
 ## Contact
 

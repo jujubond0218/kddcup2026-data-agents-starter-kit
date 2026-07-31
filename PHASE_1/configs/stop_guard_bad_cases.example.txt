@@ -1,0 +1,10 @@
+# Tasks that exhausted 20 steps in the 300-second reference run
+task_173
+task_199
+task_344
+task_396
+task_418
+task_420
+
+# Negative observation: submitted an answer but received zero semantic score
+task_80
