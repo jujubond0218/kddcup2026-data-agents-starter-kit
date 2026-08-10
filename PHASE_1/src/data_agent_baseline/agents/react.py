@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
+from data_agent_baseline.agents.evidence_plan import EvidencePlanController
 from data_agent_baseline.agents.model import (
     ModelAdapter,
     ModelMessage,
@@ -24,6 +25,10 @@ from data_agent_baseline.verification import AnswerVerifier, AnswerVerificationF
 @dataclass(frozen=True, slots=True)
 class ReActAgentConfig:
     max_steps: int = 16
+    evidence_plan_enabled: bool = False
+    evidence_plan_max_commit_attempts: int = 2
+    evidence_plan_strict_keys: bool = True
+    evidence_plan_verification_gate: bool = True
 
 
 def _step_budget_reminder(
@@ -89,6 +94,33 @@ def _protocol_error_observation(code: str, message: str) -> dict[str, object]:
     }
 
 
+def _plan_pending_result(tool_name: str) -> ToolExecutionResult:
+    """Recoverable correction for an unrelated tool called while the plan is pending.
+
+    Runtime enforcement: the wrong call is not executed, does not consume a bounded
+    commit attempt, and the agent is told to commit the plan instead. Only the step
+    budget fails the phase open.
+    """
+    return ToolExecutionResult(
+        ok=False,
+        content={
+            "error": {
+                "code": "EVIDENCE_PLAN_PENDING",
+                "message": (
+                    f"The plan is still pending and `{tool_name}` is not available. "
+                    "Call `commit_evidence_plan` now to commit a deterministic plan "
+                    "covering every pending requirement and uncertainty from the "
+                    "explore report."
+                ),
+                "recoverable": True,
+                "do_not_retry_same_call": True,
+            }
+        },
+        error_code="EVIDENCE_PLAN_PENDING",
+        recoverable=True,
+    )
+
+
 def _final_step_guard_observation(tool_name: str) -> dict[str, object]:
     return {
         "ok": False,
@@ -147,13 +179,20 @@ class ReActAgent:
         self.system_prompt = system_prompt or REACT_SYSTEM_PROMPT
         self.event_sink = event_sink
         self.answer_verifier = answer_verifier or AnswerVerifier()
+        self.evidence_plan: EvidencePlanController | None = None
 
     def _exploration_required(self) -> bool:
         return "explore" in self.tools.specs
 
     def _active_tools(
-        self, *, exploration_pending: bool, exploration_required: bool
+        self,
+        *,
+        exploration_pending: bool,
+        exploration_required: bool,
+        evidence_plan_pending: bool = False,
     ) -> ToolRegistry:
+        if evidence_plan_pending and self.evidence_plan is not None:
+            return self.evidence_plan.registry()
         if exploration_pending:
             return ToolRegistry(specs={"explore": self.tools.specs["explore"]})
         if exploration_required:
@@ -171,6 +210,7 @@ class ReActAgent:
                     system_prompt=self.system_prompt,
                     explore_available="explore" in self.tools.specs,
                     explore_required=exploration_required,
+                    evidence_plan_enabled=self.config.evidence_plan_enabled,
                 ),
             ),
             ModelMessage(
@@ -371,6 +411,239 @@ class ReActAgent:
                 labels.append(field)
         return list(dict.fromkeys(labels))
 
+    def _activate_evidence_plan(
+        self,
+        *,
+        report: dict[str, object],
+        step_index: int,
+    ) -> bool:
+        """Build the deterministic plan controller and decide whether it is pending.
+
+        The plan only activates when the feature is enabled, the report carries an
+        unresolved requirement or uncertainty, and enough normal steps remain after
+        explore. It is an opt-in experiment hook: after a successful commit the
+        answer gate (Option C) may reject the first answer once while any declared
+        verification is still unobserved.
+        """
+        if not self.config.evidence_plan_enabled:
+            return False
+        controller = EvidencePlanController(
+            report=report,
+            strict_keys=self.config.evidence_plan_strict_keys,
+        )
+        if not controller.triggered():
+            return False
+        remaining_steps = self.config.max_steps - step_index
+        if remaining_steps < 2:
+            emit_event(
+                self.event_sink,
+                "evidence_plan_skipped",
+                {
+                    "step_index": step_index,
+                    "reason": "INSUFFICIENT_STEP_BUDGET",
+                    "remaining_steps": remaining_steps,
+                    "pending_requirement_count": len(controller.pending_ids),
+                },
+            )
+            return False
+        self.evidence_plan = controller
+        emit_event(
+            self.event_sink,
+            "evidence_plan_required",
+            {
+                "step_index": step_index,
+                "remaining_steps": remaining_steps,
+                "requirement_count": len(controller.pending_ids),
+                "max_commit_attempts": self.config.evidence_plan_max_commit_attempts,
+            },
+        )
+        return True
+
+    def _record_plan_phase_failure(
+        self,
+        *,
+        error_code: str,
+        step_index: int,
+        commit_attempts: int,
+        tool_call_id: str | None = None,
+    ) -> tuple[bool, int]:
+        """Count one plan-phase failure and return (still_pending, new_attempts).
+
+        An invalid commit or protocol error consumes one bounded retry so a flailing
+        model cannot keep the plan tool exclusive until the final normal step. A
+        well-formed call to a normal tool is corrected separately by Option A and
+        does not consume a commit attempt.
+        """
+        next_attempt = commit_attempts + 1
+        remaining_steps = self.config.max_steps - step_index
+        can_retry = (
+            next_attempt < self.config.evidence_plan_max_commit_attempts and remaining_steps >= 2
+        )
+        payload: dict[str, object] = {
+            "step_index": step_index,
+            "error_code": error_code,
+            "attempt": next_attempt,
+            "max_attempts": self.config.evidence_plan_max_commit_attempts,
+            "fail_open": not can_retry,
+            "remaining_steps": remaining_steps,
+        }
+        if tool_call_id is not None:
+            payload["tool_call_id"] = tool_call_id
+        emit_event(
+            self.event_sink,
+            "evidence_plan_commit_rejected",
+            payload,
+        )
+        return can_retry, next_attempt
+
+    def _handle_evidence_plan_commit(
+        self,
+        *,
+        call: ModelToolCall,
+        tool_result: ToolExecutionResult,
+        step_index: int,
+        commit_attempts: int,
+    ) -> tuple[bool, int]:
+        """Process one commit_evidence_plan result; return (still_pending, attempts)."""
+        if tool_result.ok:
+            emit_event(
+                self.event_sink,
+                "evidence_plan_committed",
+                {
+                    "step_index": step_index,
+                    "tool_call_id": call.id,
+                    "item_count": int(tool_result.content.get("item_count", 0)),
+                    "candidate_count": int(tool_result.content.get("candidate_count", 0)),
+                    "verification_count": int(tool_result.content.get("verification_count", 0)),
+                    "requirement_ids": tool_result.content.get("requirement_ids", []),
+                },
+            )
+            return False, 0
+        return self._record_plan_phase_failure(
+            error_code=tool_result.error_code or "EVIDENCE_PLAN_COMMIT_REJECTED",
+            step_index=step_index,
+            commit_attempts=commit_attempts,
+            tool_call_id=call.id,
+        )
+
+    @staticmethod
+    def _call_path(action_input: dict[str, object] | None) -> str | None:
+        if not isinstance(action_input, dict):
+            return None
+        raw_path = action_input.get("path")
+        return str(raw_path) if isinstance(raw_path, str) else None
+
+    def _emit_evidence_plan_answered(
+        self,
+        *,
+        step_index: int,
+        observed_verifications: set[tuple[str, str]],
+    ) -> None:
+        if self.evidence_plan is None or self.evidence_plan.committed_items is None:
+            return
+        committed = self.evidence_plan.committed_verifications
+        emit_event(
+            self.event_sink,
+            "evidence_plan_answered",
+            {
+                "step_index": step_index,
+                "plan_committed": True,
+                "requirement_count": len(self.evidence_plan.pending_ids),
+                "verification_total_count": len(committed),
+                "verification_observed_count": len(observed_verifications),
+                "all_verifications_observed": all(
+                    (tool, path) in observed_verifications for tool, path in committed
+                ),
+            },
+        )
+
+    def _unobserved_verifications(
+        self,
+        observed_verifications: set[tuple[str, str]],
+    ) -> list[tuple[str, str]]:
+        """Unique committed (tool, path) checks not yet observed by a successful call."""
+        if self.evidence_plan is None or self.evidence_plan.committed_items is None:
+            return []
+        committed = self.evidence_plan.committed_verifications
+        return [
+            (tool, path)
+            for tool, path in dict.fromkeys(committed)
+            if (tool, path) not in observed_verifications
+        ]
+
+    def _verification_gate_result(
+        self,
+        *,
+        call: ModelToolCall,
+        step_index: int,
+        observed_verifications: set[tuple[str, str]],
+        answer_blocks: int,
+        finalization_retry: bool,
+    ) -> ToolExecutionResult | None:
+        """Reject the first unverified answer until every committed verification runs.
+
+        Returns the recoverable EVIDENCE_PLAN_VERIFICATION_PENDING rejection when the
+        plan is committed, at least one declared verification is still unobserved,
+        this is the first answer after commit, and the remaining step budget can
+        cover each unique missing verification plus one final answer step
+        (remaining_steps >= len(missing) + 1). Every other case returns None so the
+        normal terminal flow (projection gate + Answer Verifier) runs unchanged. The
+        gate never reads observation content or runs new tool calls; it only reuses
+        the existing successful-tool/`tool`+`path` observation set.
+        """
+        missing = self._unobserved_verifications(observed_verifications)
+        if not missing or not self.config.evidence_plan_verification_gate:
+            return None
+        if answer_blocks >= 1:
+            self._skip_verification_gate(step_index, "MAX_ANSWER_BLOCKS")
+            return None
+        if finalization_retry:
+            self._skip_verification_gate(step_index, "FINALIZATION_RETRY")
+            return None
+        remaining_steps = self.config.max_steps - step_index
+        required_steps = len(missing) + 1
+        if remaining_steps < required_steps:
+            self._skip_verification_gate(step_index, "INSUFFICIENT_STEP_BUDGET")
+            return None
+        emit_event(
+            self.event_sink,
+            "evidence_plan_answer_blocked",
+            {
+                "step_index": step_index,
+                "tool_call_id": call.id,
+                "missing_count": len(missing),
+                "missing_verifications": [{"tool": tool, "path": path} for tool, path in missing],
+            },
+        )
+        return ToolExecutionResult(
+            ok=False,
+            content={
+                "error": {
+                    "code": "EVIDENCE_PLAN_VERIFICATION_PENDING",
+                    "message": (
+                        "The committed evidence plan still has "
+                        f"{len(missing)} unobserved verification(s): "
+                        + ", ".join(f"`{tool}` on `{path}`" for tool, path in missing)
+                        + ". Complete each missing verification with a successful "
+                        "read_csv/read_json/read_doc/inspect_sqlite_schema/"
+                        "execute_context_sql call on the declared path, then call "
+                        "`answer` again."
+                    ),
+                    "recoverable": True,
+                    "do_not_retry_same_call": True,
+                }
+            },
+            error_code="EVIDENCE_PLAN_VERIFICATION_PENDING",
+            recoverable=True,
+        )
+
+    def _skip_verification_gate(self, step_index: int, reason: str) -> None:
+        emit_event(
+            self.event_sink,
+            "evidence_plan_verification_gate_skipped",
+            {"step_index": step_index, "reason": reason},
+        )
+
     def run(self, task: PublicTask) -> AgentRunResult:
         state = AgentRuntimeState()
         messages = self._initial_messages(task)
@@ -380,6 +653,11 @@ class ReActAgent:
         budget_warning_fired = False
         budget_critical_fired = False
         finalization_retry_pending = False
+        evidence_plan_pending = False
+        evidence_plan_commit_attempts = 0
+        evidence_plan_answer_blocks = 0
+        observed_verifications: set[tuple[str, str]] = set()
+        self.evidence_plan = None
         step_index = 1
 
         while step_index <= self.config.max_steps or finalization_retry_pending:
@@ -397,6 +675,10 @@ class ReActAgent:
             if finalization_retry:
                 active_tools = ToolRegistry(specs={"answer": self.tools.specs["answer"]})
             else:
+                if evidence_plan_pending and step_index >= self.config.max_steps:
+                    # Fail-open: never let the plan tool consume the final normal
+                    # step, so the deterministic answer guard can still fire.
+                    evidence_plan_pending = False
                 reminder = _step_budget_reminder(
                     used_steps=step_index - 1,
                     max_steps=self.config.max_steps,
@@ -424,6 +706,7 @@ class ReActAgent:
                 active_tools = self._active_tools(
                     exploration_pending=exploration_pending,
                     exploration_required=exploration_required,
+                    evidence_plan_pending=evidence_plan_pending,
                 )
             request_context: dict[str, object] = {
                 "task_id": task.task_id,
@@ -446,6 +729,14 @@ class ReActAgent:
                     code="NO_TOOL_CALL",
                     message="The model response did not contain a native tool call.",
                 )
+                if evidence_plan_pending:
+                    evidence_plan_pending, evidence_plan_commit_attempts = (
+                        self._record_plan_phase_failure(
+                            error_code="NO_TOOL_CALL",
+                            step_index=step_index,
+                            commit_attempts=evidence_plan_commit_attempts,
+                        )
+                    )
                 if finalization_retry:
                     break
                 step_index += 1
@@ -462,6 +753,14 @@ class ReActAgent:
                         "tool per turn."
                     ),
                 )
+                if evidence_plan_pending:
+                    evidence_plan_pending, evidence_plan_commit_attempts = (
+                        self._record_plan_phase_failure(
+                            error_code="MULTIPLE_TOOL_CALLS",
+                            step_index=step_index,
+                            commit_attempts=evidence_plan_commit_attempts,
+                        )
+                    )
                 if finalization_retry:
                     break
                 step_index += 1
@@ -477,6 +776,14 @@ class ReActAgent:
                     code="INVALID_TOOL_CALL",
                     message="A native tool call must include a non-empty id and function name.",
                 )
+                if evidence_plan_pending:
+                    evidence_plan_pending, evidence_plan_commit_attempts = (
+                        self._record_plan_phase_failure(
+                            error_code="INVALID_TOOL_CALL",
+                            step_index=step_index,
+                            commit_attempts=evidence_plan_commit_attempts,
+                        )
+                    )
                 if finalization_retry:
                     break
                 step_index += 1
@@ -543,13 +850,69 @@ class ReActAgent:
                     raw_projection = report.get("answer_projection")
                     if isinstance(raw_projection, dict):
                         answer_projection = raw_projection
-            if tool_result.is_terminal:
-                tool_result = self._verify_terminal_answer(
-                    call=call,
-                    tool_result=tool_result,
-                    step_index=step_index,
-                    answer_projection=answer_projection,
+                    evidence_plan_pending = self._activate_evidence_plan(
+                        report=report,
+                        step_index=step_index,
+                    )
+            elif evidence_plan_pending and call.name == "commit_evidence_plan":
+                evidence_plan_pending, evidence_plan_commit_attempts = (
+                    self._handle_evidence_plan_commit(
+                        call=call,
+                        tool_result=tool_result,
+                        step_index=step_index,
+                        commit_attempts=evidence_plan_commit_attempts,
+                    )
                 )
+            elif evidence_plan_pending:
+                # Runtime enforcement: a wrong tool during the plan phase is a
+                # compliance failure, not an invalid plan. Do not consume a bounded
+                # commit attempt; inject a correction and re-ask. Only the step
+                # budget fails the phase open, preserving one normal answer step.
+                if self.config.max_steps - step_index >= 2:
+                    tool_result = _plan_pending_result(call.name)
+                else:
+                    evidence_plan_pending = False
+            if tool_result.is_terminal:
+                gate = self._verification_gate_result(
+                    call=call,
+                    step_index=step_index,
+                    observed_verifications=observed_verifications,
+                    answer_blocks=evidence_plan_answer_blocks,
+                    finalization_retry=finalization_retry,
+                )
+                if gate is not None:
+                    evidence_plan_answer_blocks += 1
+                    tool_result = gate
+                else:
+                    tool_result = self._verify_terminal_answer(
+                        call=call,
+                        tool_result=tool_result,
+                        step_index=step_index,
+                        answer_projection=answer_projection,
+                    )
+            if (
+                not tool_result.is_terminal
+                and tool_result.ok
+                and self.evidence_plan is not None
+                and self.evidence_plan.committed_items is not None
+            ):
+                path = self._call_path(tool_result.action_input)
+                if (
+                    path is not None
+                    and self.evidence_plan.matches_verification(tool=call.name, path=path)
+                    and (call.name, path) not in observed_verifications
+                ):
+                    observed_verifications.add((call.name, path))
+                    emit_event(
+                        self.event_sink,
+                        "evidence_plan_verification_observed",
+                        {
+                            "step_index": step_index,
+                            "tool_call_id": call.id,
+                            "tool": call.name,
+                            "path": path,
+                        },
+                    )
             tool_event_payload = {
                 "step_index": step_index,
                 "tool_call_id": call.id,
@@ -603,6 +966,10 @@ class ReActAgent:
             )
             if tool_result.is_terminal:
                 state.answer = tool_result.answer
+                self._emit_evidence_plan_answered(
+                    step_index=step_index,
+                    observed_verifications=observed_verifications,
+                )
                 break
             if finalization_retry:
                 break

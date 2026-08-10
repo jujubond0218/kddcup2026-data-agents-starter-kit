@@ -33,6 +33,7 @@ configs/*
 !configs/regression_tasks.example.txt
 !configs/tool_error_guidance_tasks.example.txt
 !configs/stop_guard_bad_cases.example.txt
+!configs/evidence_plan_bad_cases.example.txt
 
 # OS / notebook noise
 .DS_Store

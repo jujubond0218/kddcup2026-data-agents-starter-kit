@@ -145,7 +145,13 @@ def _run_single_task_core(
     agent = ReActAgent(
         model=effective_model,
         tools=effective_tools,
-        config=ReActAgentConfig(max_steps=config.agent.max_steps),
+        config=ReActAgentConfig(
+            max_steps=config.agent.max_steps,
+            evidence_plan_enabled=config.evidence_plan.enabled,
+            evidence_plan_max_commit_attempts=config.evidence_plan.max_commit_attempts,
+            evidence_plan_strict_keys=config.evidence_plan.strict_keys,
+            evidence_plan_verification_gate=config.evidence_plan.verification_gate,
+        ),
         event_sink=event_sink,
     )
     run_result = agent.run(task)

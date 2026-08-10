@@ -223,3 +223,20 @@ def test_records_provider_usage_when_it_is_available():
         payload for event_type, payload in events if event_type == "model_request_succeeded"
     )
     assert succeeded["usage"] == response.usage
+
+
+def test_complete_keeps_tool_choice_auto_when_tools_present():
+    # Request-layer invariant for the evidence-plan runtime enforcement: the pending
+    # phase never forces tool_choice (DashScope rejects required/object in thinking
+    # mode), so a tools-enabled request must still advertise tool_choice="auto".
+    adapter, client, _ = _adapter(["ok"])
+
+    adapter.complete(
+        [ModelMessage(role="user", content="hello")],
+        tools=FakeTools(),
+    )
+
+    request = client.completions.requests[0]
+    assert request["tool_choice"] == "auto"
+    assert request["parallel_tool_calls"] is False
+    assert [tool["function"]["name"] for tool in request["tools"]] == ["list_context"]

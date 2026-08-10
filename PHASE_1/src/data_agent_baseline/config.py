@@ -58,11 +58,20 @@ class ExplorerConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class EvidencePlanConfig:
+    enabled: bool = False
+    max_commit_attempts: int = 2
+    strict_keys: bool = True
+    verification_gate: bool = True
+
+
+@dataclass(frozen=True, slots=True)
 class AppConfig:
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
     run: RunConfig = field(default_factory=RunConfig)
     explorer: ExplorerConfig = field(default_factory=ExplorerConfig)
+    evidence_plan: EvidencePlanConfig = field(default_factory=EvidencePlanConfig)
 
 
 def _path_value(raw_value: str | None, default_value: Path) -> Path:
@@ -80,11 +89,13 @@ def load_app_config(config_path: Path) -> AppConfig:
     agent_defaults = AgentConfig()
     run_defaults = RunConfig()
     explorer_defaults = ExplorerConfig()
+    evidence_plan_defaults = EvidencePlanConfig()
 
     dataset_payload = payload.get("dataset", {})
     agent_payload = payload.get("agent", {})
     run_payload = payload.get("run", {})
     explorer_payload = payload.get("explorer", {})
+    evidence_plan_payload = payload.get("evidence_plan", {})
 
     dataset_config = DatasetConfig(
         root_path=_path_value(dataset_payload.get("root_path"), dataset_defaults.root_path),
@@ -156,9 +167,28 @@ def load_app_config(config_path: Path) -> AppConfig:
         max_pdf_bytes=int(explorer_payload.get("max_pdf_bytes", explorer_defaults.max_pdf_bytes)),
         max_pdf_pages=int(explorer_payload.get("max_pdf_pages", explorer_defaults.max_pdf_pages)),
     )
+    raw_max_commit_attempts = int(
+        evidence_plan_payload.get(
+            "max_commit_attempts",
+            evidence_plan_defaults.max_commit_attempts,
+        )
+    )
+    if raw_max_commit_attempts not in (1, 2):
+        raise ValueError("evidence_plan.max_commit_attempts must be 1 or 2.")
+    evidence_plan_config = EvidencePlanConfig(
+        enabled=bool(evidence_plan_payload.get("enabled", evidence_plan_defaults.enabled)),
+        max_commit_attempts=raw_max_commit_attempts,
+        strict_keys=bool(
+            evidence_plan_payload.get("strict_keys", evidence_plan_defaults.strict_keys)
+        ),
+        verification_gate=bool(
+            evidence_plan_payload.get("verification_gate", evidence_plan_defaults.verification_gate)
+        ),
+    )
     return AppConfig(
         dataset=dataset_config,
         agent=agent_config,
         run=run_config,
         explorer=explorer_config,
+        evidence_plan=evidence_plan_config,
     )

@@ -109,6 +109,12 @@ explorer:
   max_preview_chars: 2000
   max_inventory_chars: 12000
   max_report_chars: 4000
+
+evidence_plan:
+  enabled: false
+  max_commit_attempts: 2
+  strict_keys: true
+  verification_gate: true
 ```
 
 配置字段说明：
@@ -131,6 +137,10 @@ explorer:
 | `explorer.enabled` | 是否在主 Agent 首轮仅暴露一次无参数 `explore({})`；确定性 Inventory 与 knowledge 证据在工具内部生成。 |
 | `explorer.max_steps` | Explorer 模型请求上限，默认和有效硬上限均为 2；第一次直接报告或提出一次定向补查，第二次只允许报告。旧配置中的更大值仍可读取，但不会扩展自由探索轮数。 |
 | `explorer.max_duration_seconds` | Explorer 软墙钟上限；超限时先用已有证据生成有界 fallback，避免直接耗尽任务级硬超时。 |
+| `evidence_plan.enabled` | 为 true 时，Explorer 报告出现未解 requirement 或 uncertainty，主 Agent 会被要求先提交一份确定性证据计划。默认关闭且不读 gold、不判断答案语义。 |
+| `evidence_plan.max_commit_attempts` | pending 阶段允许的无效计划或协议错误次数（仅 1 或 2）；达到上限后 fail-open。普通工具误调用由运行时纠正，不消耗提交次数。 |
+| `evidence_plan.strict_keys` | 默认 true；把每个 pending requirement ID 固定为动态 schema 的必填键，缺失或额外键在参数层拒绝。false 仅用于 Option A 消融。 |
+| `evidence_plan.verification_gate` | 默认 true；计划提交后，首次 answer 若仍缺少声明的成功 `tool + path` 调用且预算足够，则返回一次可恢复错误。false 仅用于 A+B 消融。 |
 
 ## CLI
 
