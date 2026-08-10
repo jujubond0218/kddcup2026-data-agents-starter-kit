@@ -12,6 +12,11 @@ English | [中文](README.zh.md)
 
 > Official starter kit for the KDD Cup 2026 DataAgent-Bench challenge. The repository reads tasks from `data/public/input/` and writes predictions for downstream evaluation.
 
+> [!NOTE]
+> This fork adds the Phase 1 evaluation, reliability, native-tool, Explorer, verification, and
+> Evidence Plan work summarized in the [engineering and experiment index](docs/README.md).
+> Public local benchmark results are not official hidden-leaderboard scores.
+
 ## Overview
 
 | Item | Value |
@@ -305,23 +310,14 @@ The command writes `scores.json` into the run directory. See
 [`docs/evaluation.md`](docs/evaluation.md) for the scoring formula,
 normalization rules, and interpretation of partial runs.
 
-The motivation, implementation changes, and sanitized runtime comparison for the
-reliability work are recorded in
-[`docs/2026-07-24-runner-reliability.md`](docs/2026-07-24-runner-reliability.md).
-The native tool protocol, validation behavior, trace compatibility, and verification
-results are recorded in
-[`docs/2026-07-24-native-tool-calling.md`](docs/2026-07-24-native-tool-calling.md).
-The deterministic pre-submit checks and correction flow are documented in
-[`docs/2026-07-24-answer-verification.md`](docs/2026-07-24-answer-verification.md).
-The bounded Explorer design, limits, fallback behavior, and evaluation boundaries are recorded in
-[`docs/2026-07-27-context-explorer.md`](docs/2026-07-27-context-explorer.md).
-The step-budget reminders, final-step guard, Trace behavior, and targeted bad-case protocol are
-documented in
-[`docs/2026-07-31-step-budget-stop-guard.md`](docs/2026-07-31-step-budget-stop-guard.md).
+The [engineering and experiment index](docs/README.md) organizes the design records for local
+evaluation, Runner and Python reliability, native tool calling, recoverable errors, bounded
+Explorer behavior, answer verification, step-budget finalization, and Evidence Plan ablations.
 
 ## Contact
 
-- Open issues: https://github.com/HKUSTDial/kddcup2026-data-agents-starter-kit/issues
+- Personal fork issues: https://github.com/jujubond0218/kddcup2026-data-agents-starter-kit/issues
+- Official upstream: https://github.com/HKUSTDial/kddcup2026-data-agents-starter-kit
 - Official website: https://dataagent.top
 - Discord: https://discord.com/invite/7eFwJQN3Fx
 - WeChat official account: `数据智能与分析实验室 DIAL`

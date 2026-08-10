@@ -1,6 +1,6 @@
 <div align="center">
 
-# KDD Cup 2026 DataAgent-Bench Starter Kit
+# KDD Cup 2026 DataAgent-Bench — Phase 1 Engineering Fork
 
 English | [中文](README.zh.md)
 
@@ -9,7 +9,48 @@ English | [中文](README.zh.md)
 
 </div>
 
-This repository provides baseline starter kits for KDD Cup 2026 DataAgent-Bench. It is organized by competition phase so participants can start from the package that matches the phase they are working on.
+> [!NOTE]
+> This is a personal research fork of the
+> [official KDD Cup 2026 starter kit](https://github.com/HKUSTDial/kddcup2026-data-agents-starter-kit).
+> The work in this fork is limited to Phase 1; Phase 2 remains the upstream baseline. See
+> [NOTICE.md](NOTICE.md) for project provenance and scope.
+
+This project turns the instructional Phase 1 ReAct baseline into a reproducible data-agent
+research harness for heterogeneous CSV, JSON, SQLite, Markdown, text, and text-based PDF inputs.
+The main contribution is an end-to-end engineering loop that separates runtime success,
+protocol correctness, auditability, and semantic answer quality.
+
+## Phase 1 Highlights
+
+| Area | Contribution | Evidence |
+| --- | --- | --- |
+| Native tool protocol | Replaced text JSON actions with OpenAI-compatible `tools/tool_calls`, strict Pydantic validation, matched call IDs, and recoverable tool observations. | In a 12-task regression, extra answer columns fell from 11 to 1; 12/12 targeted path/type errors were corrected on the next turn. |
+| Reliable execution | Added bounded request retries, task subprocess timeouts, live events, resume/retry, and a clean `spawn + Pipe` Python lifecycle. | Historical 600-second stalls completed in about 18–29 seconds with diagnostics; 136/136 Python calls returned in a 50-task run. |
+| Bounded planning and verification | Added deterministic context inventory, a bounded Explorer, answer verification, step-budget guards, and an opt-in Evidence Plan protocol. | Evidence-plan submission rose from 14.8% to 72.4%; declared-verification observation reached 92%–93.5%, without claiming stable semantic gain. |
+| Reproducible evaluation | Added a local scorer, fixed regression selections, scripted tests, experiment records, and explicit go/no-go criteria. | Public 50-task local score: 0.4840 initial baseline, 0.7237 best single run; the repeated mainline reference averaged 0.6869 across three runs. |
+
+All scores above come from the public 50-task local benchmark, not the official hidden
+leaderboard. A single best run is an observed result rather than evidence that one change caused
+the full improvement.
+
+```text
+Task + heterogeneous context
+→ bounded Explorer / evidence map
+→ native tool-calling ReAct agent
+→ data tools and isolated Python execution
+→ deterministic answer verification
+→ prediction + live events + trace
+→ local scorer and regression analysis
+```
+
+For implementation details and negative-result boundaries, start with the
+[Phase 1 documentation index](PHASE_1/docs/README.md).
+
+## Upstream Starter Kit
+
+The upstream repository provides baseline starter kits for KDD Cup 2026 DataAgent-Bench. It is
+organized by competition phase so participants can start from the package matching the phase they
+are working on.
 
 ## Repository Layout
 
@@ -72,63 +113,21 @@ uv.lock                           # Locked dependency versions
 - Keep local run outputs under `artifacts/`; they are not intended to be committed.
 - Review the phase-specific README before packaging or submitting a solution.
 
-## Engineering Notes
+## Documentation and Support
 
-- [2026-07-23: Phase 1 Local Evaluation Pipeline](PHASE_1/docs/2026-07-23-phase1-evaluation-pipeline.md)
-- [2026-07-24: Phase 1 Runner Reliability](PHASE_1/docs/2026-07-24-runner-reliability.md)
-- [2026-07-24: Phase 1 Native Tool Calling](PHASE_1/docs/2026-07-24-native-tool-calling.md)
-- [2026-07-24: Phase 1 Deterministic Answer Verification](PHASE_1/docs/2026-07-24-answer-verification.md)
-- [2026-07-27: Phase 1 Bounded Context Explorer](PHASE_1/docs/2026-07-27-context-explorer.md)
-- [2026-07-31: Phase 1 Step-Budget Stop Guard](PHASE_1/docs/2026-07-31-step-budget-stop-guard.md)
+- Personal fork issues: https://github.com/jujubond0218/kddcup2026-data-agents-starter-kit/issues
+- Phase 1 usage: [PHASE_1/README.md](PHASE_1/README.md)
+- Engineering and experiment index: [PHASE_1/docs/README.md](PHASE_1/docs/README.md)
+- Project provenance: [NOTICE.md](NOTICE.md)
+- Official upstream and competition support:
+  [HKUSTDial starter kit](https://github.com/HKUSTDial/kddcup2026-data-agents-starter-kit),
+  [website](https://dataagent.top), and
+  [Discord](https://discord.com/invite/7eFwJQN3Fx)
 
-## Contact
+## Upstream Baseline Modules
 
-- Open issues: https://github.com/HKUSTDial/kddcup2026-data-agents-starter-kit/issues
-- Official website: https://dataagent.top
-- Discord: https://discord.com/invite/7eFwJQN3Fx
-- WeChat official account: `数据智能与分析实验室 DIAL`
-
-<div align="center">
-  <table>
-    <tr>
-      <td align="center">
-        <a href="https://dataagent.top">
-          <img
-            src="https://api.qrserver.com/v1/create-qr-code/?size=144x144&data=https://dataagent.top&bgcolor=ffffff&color=111827&margin=8"
-            alt="Official website QR code"
-            width="144"
-          />
-        </a>
-        <br />
-        Official Website
-      </td>
-      <td align="center">
-        <a href="https://discord.com/invite/7eFwJQN3Fx">
-          <img
-            src="https://api.qrserver.com/v1/create-qr-code/?size=144x144&data=https://discord.com/invite/7eFwJQN3Fx&bgcolor=ffffff&color=111827&margin=8"
-            alt="Discord QR code"
-            width="144"
-          />
-        </a>
-        <br />
-        Discord
-      </td>
-      <td align="center">
-        <img
-          src="https://dataagent.top/HKUSTGZ_DIAL.jpg"
-          alt="WeChat official account QR code"
-          width="144"
-        />
-        <br />
-        WeChat Official Account
-      </td>
-    </tr>
-  </table>
-</div>
-
-## Main Modules
-
-The same baseline layout is used inside each phase directory. For example, after entering `PHASE_1/` or `PHASE_2/`, the core modules are:
+The upstream baseline layout below is shared by both phase directories. The current Phase 1
+module and tool map is documented in [PHASE_1/README.md](PHASE_1/README.md).
 
 | Module | Responsibility |
 | --- | --- |
