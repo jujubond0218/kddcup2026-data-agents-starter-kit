@@ -9,7 +9,10 @@ from pathlib import Path
 import pytest
 
 from data_agent_baseline.tools import python_exec
-from data_agent_baseline.tools.python_exec import execute_python_code
+from data_agent_baseline.tools.python_exec import (
+    PYTHON_CAPTURE_STREAM_MAX_BYTES,
+    execute_python_code,
+)
 
 
 def _nested_python_execution(context_root: str, result_path: str, marker: int) -> None:
@@ -58,6 +61,90 @@ def test_python_execution_captures_stdout_stderr_and_exception(tmp_path):
     assert failure["success"] is False
     assert failure["error"] == "synthetic failure"
     assert "ValueError: synthetic failure" in failure["traceback"]
+
+
+def test_python_execution_truncates_large_stdout_with_consistent_metadata(tmp_path):
+    result = execute_python_code(
+        tmp_path,
+        "print('HEAD-' + ('x' * 200_000) + '-TAIL')",
+        timeout_seconds=5,
+    )
+
+    assert result["success"] is True
+    assert result["truncated"] is True
+    assert result["output"].startswith("HEAD-")
+    assert result["output"].endswith("-TAIL\n")
+    output_capture = result["capture"]["output"]
+    marker = f"\n... [TRUNCATED: {output_capture['omitted_bytes']} bytes omitted] ...\n"
+    assert marker in result["output"]
+    assert output_capture["truncated"] is True
+    assert output_capture["original_bytes"] == 200_011
+    assert output_capture["returned_bytes"] == len(result["output"].encode("utf-8"))
+    assert output_capture["returned_bytes"] <= PYTHON_CAPTURE_STREAM_MAX_BYTES
+    kept_text = result["output"].replace(marker, "", 1)
+    assert len(kept_text.encode("utf-8")) == (
+        output_capture["original_bytes"] - output_capture["omitted_bytes"]
+    )
+    assert result["capture"]["stderr"] == {
+        "truncated": False,
+        "original_bytes": 0,
+        "returned_bytes": 0,
+        "omitted_bytes": 0,
+    }
+
+
+def test_python_execution_truncates_large_stderr_independently(tmp_path):
+    result = execute_python_code(
+        tmp_path,
+        (
+            "import sys\n"
+            "print('stdout-small')\n"
+            "print('STDERR-HEAD-' + ('y' * 200_000) + '-STDERR-TAIL', file=sys.stderr)"
+        ),
+        timeout_seconds=5,
+    )
+
+    assert result["output"] == "stdout-small\n"
+    assert result["stderr"].startswith("STDERR-HEAD-")
+    assert result["stderr"].endswith("-STDERR-TAIL\n")
+    assert result["capture"]["output"] == {
+        "truncated": False,
+        "original_bytes": len("stdout-small\n"),
+        "returned_bytes": len("stdout-small\n"),
+        "omitted_bytes": 0,
+    }
+    stderr_capture = result["capture"]["stderr"]
+    assert stderr_capture["truncated"] is True
+    assert stderr_capture["returned_bytes"] == len(result["stderr"].encode("utf-8"))
+    assert stderr_capture["returned_bytes"] <= PYTHON_CAPTURE_STREAM_MAX_BYTES
+
+
+def test_python_execution_preserves_utf8_across_head_and_tail_boundaries(tmp_path):
+    result = execute_python_code(
+        tmp_path,
+        "print('你' * 30_000)",
+        timeout_seconds=5,
+    )
+
+    assert result["truncated"] is True
+    assert "\ufffd" not in result["output"]
+    assert result["output"].startswith("你")
+    assert result["output"].endswith("你\n")
+    assert len(result["output"].encode("utf-8")) <= PYTHON_CAPTURE_STREAM_MAX_BYTES
+
+
+def test_python_execution_keeps_exception_after_truncating_prior_output(tmp_path):
+    result = execute_python_code(
+        tmp_path,
+        "print('x' * 200_000)\nraise ValueError('failure after output')",
+        timeout_seconds=5,
+    )
+
+    assert result["success"] is False
+    assert result["truncated"] is True
+    assert result["error"] == "failure after output"
+    assert "ValueError: failure after output" in result["traceback"]
+    assert len(result["output"].encode("utf-8")) <= PYTHON_CAPTURE_STREAM_MAX_BYTES
 
 
 def test_python_execution_returns_when_child_exits_without_result(tmp_path):

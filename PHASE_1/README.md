@@ -238,7 +238,7 @@ The baseline exposes these tools to the model:
 | `read_doc` | Read a text document preview. | `path`, `max_chars` |
 | `inspect_sqlite_schema` | Inspect tables in a SQLite / DB file. | `path` |
 | `execute_context_sql` | Execute read-only SQL against a SQLite / DB file in `context/`. | `path`, `sql`, `limit` |
-| `execute_python` | Execute Python code inside the task `context/` directory in a clean spawned child process with a fixed 30-second execution limit and bounded cleanup. This lifecycle isolation is not an OS security sandbox. | `code` |
+| `execute_python` | Execute Python code inside the task `context/` directory in a clean spawned child process with a fixed 30-second execution limit and bounded cleanup. Returned stdout and stderr are each capped at 64 KiB; truncated streams retain their beginning and end plus byte-count metadata. This lifecycle isolation is not an OS security sandbox. | `code` |
 | `answer` | Submit the final answer table and terminate the task. | `columns`, `rows` |
 
 All file paths passed to tools must be relative to the task `context/` directory.

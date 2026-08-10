@@ -15,6 +15,7 @@ from data_agent_baseline.config import (
     RunConfig,
 )
 from data_agent_baseline.run.runner import run_benchmark
+from data_agent_baseline.tools.python_exec import PYTHON_CAPTURE_STREAM_MAX_BYTES
 from data_agent_baseline.tools.registry import (
     ToolRegistry,
     ToolSpec,
@@ -113,6 +114,31 @@ def test_runs_native_tool_loop_and_replays_matching_call_id(tmp_path):
         payload for kind, payload in events if kind == "answer_verification_passed"
     )
     assert verification_passed["tool_call_id"] == "call_answer_one"
+
+
+def test_next_model_request_receives_bounded_python_observation(tmp_path):
+    model = ScriptedModelAdapter(
+        [
+            _tool_response(
+                "execute_python",
+                {"code": "print('HEAD-' + ('x' * 200_000) + '-TAIL')"},
+                call_id="call_python_large",
+            ),
+            _answer_response(),
+        ]
+    )
+    agent = ReActAgent(model=model, tools=create_default_tool_registry())
+
+    result = agent.run(_task(tmp_path))
+
+    assert result.succeeded is True
+    observation = json.loads(model.requests[1][-1].content)
+    content = observation["content"]
+    assert content["truncated"] is True
+    assert content["output"].startswith("HEAD-")
+    assert content["output"].endswith("-TAIL\n")
+    returned_bytes = content["capture"]["output"]["returned_bytes"]
+    assert returned_bytes <= PYTHON_CAPTURE_STREAM_MAX_BYTES
 
 
 def test_budget_reminders_are_injected_once_before_steps_15_and_19(tmp_path):

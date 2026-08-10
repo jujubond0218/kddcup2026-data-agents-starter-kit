@@ -24,7 +24,10 @@ from data_agent_baseline.tools.filesystem import (
     read_json_preview,
     resolve_context_path,
 )
-from data_agent_baseline.tools.python_exec import execute_python_code
+from data_agent_baseline.tools.python_exec import (
+    PYTHON_CAPTURE_STREAM_MAX_BYTES,
+    execute_python_code,
+)
 from data_agent_baseline.tools.sqlite import execute_read_only_sql, inspect_sqlite_schema
 
 EXECUTE_PYTHON_TIMEOUT_SECONDS = 30
@@ -332,7 +335,9 @@ def create_default_tool_registry() -> ToolRegistry:
             name="execute_python",
             description=(
                 "Execute arbitrary Python code with the task context directory as the "
-                "working directory. The tool returns the code's captured stdout as `output`. "
+                "working directory. The tool returns captured stdout as `output`; stdout and "
+                f"stderr are each capped at {PYTHON_CAPTURE_STREAM_MAX_BYTES // 1024} KiB, "
+                "with the head and tail retained when truncated. "
                 f"The execution timeout is fixed at {EXECUTE_PYTHON_TIMEOUT_SECONDS} seconds."
             ),
             input_model=ExecutePythonInput,

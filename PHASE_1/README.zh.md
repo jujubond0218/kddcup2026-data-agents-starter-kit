@@ -233,7 +233,7 @@ Inventory 无法判断关键来源或字段时，才允许一次定向补查，�
 | `read_doc` | 读取文本文档预览。 | `path`、`max_chars` |
 | `inspect_sqlite_schema` | 查看 SQLite / DB 文件中的表结构。 | `path` |
 | `execute_context_sql` | 对 `context/` 内 SQLite / DB 文件执行只读 SQL。 | `path`、`sql`、`limit` |
-| `execute_python` | 在干净启动的子进程中执行任务 `context/` 目录内的 Python 代码，固定执行上限为 30 秒，并采用有界进程回收；这种生命周期隔离不等于操作系统安全沙箱。 | `code` |
+| `execute_python` | 在干净启动的子进程中执行任务 `context/` 目录内的 Python 代码，固定执行上限为 30 秒，并采用有界进程回收。返回的 stdout、stderr 各自最多 64 KiB；截断时保留开头、结尾和字节数元数据。这种生命周期隔离不等于操作系统安全沙箱。 | `code` |
 | `answer` | 提交最终答案表格并结束当前任务。 | `columns`、`rows` |
 
 所有文件路径都必须是相对于任务 `context/` 目录的相对路径。
