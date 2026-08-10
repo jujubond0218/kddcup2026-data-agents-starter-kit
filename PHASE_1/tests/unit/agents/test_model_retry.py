@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import httpx
@@ -223,6 +224,55 @@ def test_records_provider_usage_when_it_is_available():
         payload for event_type, payload in events if event_type == "model_request_succeeded"
     )
     assert succeeded["usage"] == response.usage
+
+
+def test_records_request_input_metrics_without_message_content():
+    events = []
+    adapter, client, _ = _adapter(
+        ["ok"],
+        event_sink=lambda event_type, payload: events.append((event_type, payload)),
+    )
+    prior_call = ModelToolCall(
+        id="call_previous",
+        name="list_context",
+        arguments='{"max_depth":2}',
+    )
+
+    adapter.complete(
+        [
+            ModelMessage(role="system", content="系统规则"),
+            ModelMessage(role="user", content="inspect the task"),
+            ModelMessage(role="assistant", content="", tool_calls=(prior_call,)),
+            ModelMessage(
+                role="tool",
+                content='{"ok":true,"content":"private observation"}',
+                tool_call_id="call_previous",
+            ),
+        ],
+        tools=FakeTools(),
+    )
+
+    request = client.completions.requests[0]
+    expected_payload_bytes = len(
+        json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    )
+    started = next(
+        payload for event_type, payload in events if event_type == "model_request_started"
+    )
+    metrics = started["input_metrics"]
+
+    assert metrics["payload_bytes"] == expected_payload_bytes
+    assert metrics["message_count"] == 4
+    assert metrics["tool_schema_count"] == 1
+    assert metrics["tool_schemas_bytes"] > 0
+    assert metrics["messages_by_role"]["tool"]["count"] == 1
+    assert metrics["messages_by_role"]["tool"]["content_bytes"] == len(
+        '{"ok":true,"content":"private observation"}'.encode()
+    )
+    assert metrics["max_message_bytes"] >= metrics["max_content_bytes"]
+    rendered_metrics = json.dumps(metrics, ensure_ascii=False)
+    assert "系统规则" not in rendered_metrics
+    assert "private observation" not in rendered_metrics
 
 
 def test_complete_keeps_tool_choice_auto_when_tools_present():

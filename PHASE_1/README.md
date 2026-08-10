@@ -247,6 +247,10 @@ Recoverable file errors from the main tools include structured correction guidan
 while `NOT_SQLITE` recommends the reader matching a non-SQLite file. Both mark
 `do_not_retry_same_call` so the next turn can correct directly; tool availability and input
 schemas remain unchanged.
+For known non-terminal tools, a third consecutive call with the same validated arguments is not
+executed. The runtime returns a recoverable `REPEATED_IDENTICAL_TOOL_CALL` observation using the
+original call ID and asks the model to reuse prior evidence or change its approach. Calling a
+different tool or changing the arguments resets the counter.
 `explore` no longer advertises `inspect_files` to the model. Deterministic Inventory is completed
 before the first Explorer request and covers CSV/TSV, JSON, SQLite, Markdown, text, and text-based
 PDF inputs. `knowledge.md` uses a separate budget to select the question-relevant section, which
@@ -293,7 +297,10 @@ artifacts/runs/<run_id>/summary.json
 
 `events.jsonl` is flushed after every model request, tool call, and completed step, so a
 hard timeout still leaves diagnostic progress. Retried task artifacts are archived under
-`<task_id>/attempts/attempt_NNN/`.
+`<task_id>/attempts/attempt_NNN/`. Every `model_request_started` event records numeric-only
+`input_metrics`: compact UTF-8 payload bytes, message counts and sizes, per-role totals, and tool
+schema bytes. Successful requests separately retain provider-reported token usage; neither metric
+contains message or schema content.
 
 ## Local Evaluation
 
