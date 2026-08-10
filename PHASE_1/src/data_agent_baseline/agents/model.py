@@ -94,6 +94,47 @@ def _serialize_response(
     )
 
 
+def _serialized_utf8_bytes(value: object) -> int:
+    rendered = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return len(rendered.encode("utf-8"))
+
+
+def _request_input_metrics(request_payload: dict[str, Any]) -> dict[str, Any]:
+    messages = request_payload["messages"]
+    role_metrics: dict[str, dict[str, int]] = {}
+    max_message_bytes = 0
+    max_content_bytes = 0
+    for message in messages:
+        message_bytes = _serialized_utf8_bytes(message)
+        content = message.get("content")
+        content_bytes = len(content.encode("utf-8")) if isinstance(content, str) else 0
+        max_message_bytes = max(max_message_bytes, message_bytes)
+        max_content_bytes = max(max_content_bytes, content_bytes)
+
+        role = str(message.get("role", "unknown"))
+        metrics = role_metrics.setdefault(
+            role,
+            {"count": 0, "serialized_bytes": 0, "content_bytes": 0},
+        )
+        metrics["count"] += 1
+        metrics["serialized_bytes"] += message_bytes
+        metrics["content_bytes"] += content_bytes
+
+    tool_schemas = request_payload.get("tools")
+    return {
+        "payload_bytes": _serialized_utf8_bytes(request_payload),
+        "message_count": len(messages),
+        "messages_bytes": _serialized_utf8_bytes(messages),
+        "max_message_bytes": max_message_bytes,
+        "max_content_bytes": max_content_bytes,
+        "messages_by_role": {role: role_metrics[role] for role in sorted(role_metrics)},
+        "tool_schema_count": len(tool_schemas) if isinstance(tool_schemas, list) else 0,
+        "tool_schemas_bytes": (
+            _serialized_utf8_bytes(tool_schemas) if isinstance(tool_schemas, list) else 0
+        ),
+    }
+
+
 class OpenAIModelAdapter:
     def __init__(
         self,
@@ -246,6 +287,7 @@ class OpenAIModelAdapter:
                     "parallel_tool_calls": False,
                 }
             )
+        input_metrics = _request_input_metrics(request_payload)
 
         max_attempts = self.max_retries + 1
         for attempt in range(1, max_attempts + 1):
@@ -258,6 +300,7 @@ class OpenAIModelAdapter:
                     "attempt": attempt,
                     "max_attempts": max_attempts,
                     "timeout_seconds": self.request_timeout_seconds,
+                    "input_metrics": input_metrics,
                 },
             )
             try:

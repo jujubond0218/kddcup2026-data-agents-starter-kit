@@ -238,7 +238,7 @@ The baseline exposes these tools to the model:
 | `read_doc` | Read a text document preview. | `path`, `max_chars` |
 | `inspect_sqlite_schema` | Inspect tables in a SQLite / DB file. | `path` |
 | `execute_context_sql` | Execute read-only SQL against a SQLite / DB file in `context/`. | `path`, `sql`, `limit` |
-| `execute_python` | Execute Python code inside the task `context/` directory in a clean spawned child process with a fixed 30-second execution limit and bounded cleanup. This lifecycle isolation is not an OS security sandbox. | `code` |
+| `execute_python` | Execute Python code inside the task `context/` directory in a clean spawned child process with a fixed 30-second execution limit and bounded cleanup. Returned stdout and stderr are each capped at 64 KiB; truncated streams retain their beginning and end plus byte-count metadata. This lifecycle isolation is not an OS security sandbox. | `code` |
 | `answer` | Submit the final answer table and terminate the task. | `columns`, `rows` |
 
 All file paths passed to tools must be relative to the task `context/` directory.
@@ -247,6 +247,10 @@ Recoverable file errors from the main tools include structured correction guidan
 while `NOT_SQLITE` recommends the reader matching a non-SQLite file. Both mark
 `do_not_retry_same_call` so the next turn can correct directly; tool availability and input
 schemas remain unchanged.
+For known non-terminal tools, a third consecutive call with the same validated arguments is not
+executed. The runtime returns a recoverable `REPEATED_IDENTICAL_TOOL_CALL` observation using the
+original call ID and asks the model to reuse prior evidence or change its approach. Calling a
+different tool or changing the arguments resets the counter.
 `explore` no longer advertises `inspect_files` to the model. Deterministic Inventory is completed
 before the first Explorer request and covers CSV/TSV, JSON, SQLite, Markdown, text, and text-based
 PDF inputs. `knowledge.md` uses a separate budget to select the question-relevant section, which
@@ -293,7 +297,10 @@ artifacts/runs/<run_id>/summary.json
 
 `events.jsonl` is flushed after every model request, tool call, and completed step, so a
 hard timeout still leaves diagnostic progress. Retried task artifacts are archived under
-`<task_id>/attempts/attempt_NNN/`.
+`<task_id>/attempts/attempt_NNN/`. Every `model_request_started` event records numeric-only
+`input_metrics`: compact UTF-8 payload bytes, message counts and sizes, per-role totals, and tool
+schema bytes. Successful requests separately retain provider-reported token usage; neither metric
+contains message or schema content.
 
 ## Local Evaluation
 

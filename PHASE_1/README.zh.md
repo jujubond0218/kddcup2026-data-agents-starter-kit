@@ -233,7 +233,7 @@ Inventory 无法判断关键来源或字段时，才允许一次定向补查，�
 | `read_doc` | 读取文本文档预览。 | `path`、`max_chars` |
 | `inspect_sqlite_schema` | 查看 SQLite / DB 文件中的表结构。 | `path` |
 | `execute_context_sql` | 对 `context/` 内 SQLite / DB 文件执行只读 SQL。 | `path`、`sql`、`limit` |
-| `execute_python` | 在干净启动的子进程中执行任务 `context/` 目录内的 Python 代码，固定执行上限为 30 秒，并采用有界进程回收；这种生命周期隔离不等于操作系统安全沙箱。 | `code` |
+| `execute_python` | 在干净启动的子进程中执行任务 `context/` 目录内的 Python 代码，固定执行上限为 30 秒，并采用有界进程回收。返回的 stdout、stderr 各自最多 64 KiB；截断时保留开头、结尾和字节数元数据。这种生命周期隔离不等于操作系统安全沙箱。 | `code` |
 | `answer` | 提交最终答案表格并结束当前任务。 | `columns`、`rows` |
 
 所有文件路径都必须是相对于任务 `context/` 目录的相对路径。
@@ -241,6 +241,9 @@ Inventory 无法判断关键来源或字段时，才允许一次定向补查，�
 调用 `list_context` 或复用 Explorer 报告中的精确路径；SQL/schema 工具收到非 SQLite
 文件时使用 `NOT_SQLITE`，并根据文件类型建议对应读取工具。两类错误都标记
 `do_not_retry_same_call`，用于引导下一轮直接纠正；工具可见性和输入 schema 不变。
+对于已注册的非终止工具，同一工具和校验后参数连续调用到第 3 次时不会进入 handler；运行时
+使用原始 call ID 返回可恢复的 `REPEATED_IDENTICAL_TOOL_CALL` observation，引导模型复用
+已有证据或改变方法。更换工具或修改参数会清零连续计数。
 `explore` 不再把 `inspect_files` 暴露给模型：确定性 Inventory 在首个 Explorer 请求前
 完成，覆盖 CSV/TSV、JSON、SQLite、Markdown、文本和文本型 PDF；`knowledge.md` 使用
 独立预算选择与题目最相关的章节，并以 `knowledge.source_evidence` 进入最终说明书。
@@ -284,7 +287,9 @@ artifacts/runs/<run_id>/summary.json
 
 `events.jsonl` 会在每次模型请求、工具调用和步骤完成后立即刷新，因此任务被硬超时终止后
 仍能保留诊断进度。重跑任务的旧产物会归档到
-`<task_id>/attempts/attempt_NNN/`。
+`<task_id>/attempts/attempt_NNN/`。每条 `model_request_started` 都会记录只含数值的
+`input_metrics`，包括紧凑 UTF-8 请求字节数、消息数量与大小、各角色合计和工具 schema
+字节数；成功请求另行保留服务端返回的 Token 用量，两类指标都不包含消息或 schema 原文。
 
 ## 本地评测
 

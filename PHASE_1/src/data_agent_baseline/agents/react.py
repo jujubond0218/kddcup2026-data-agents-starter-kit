@@ -145,6 +145,59 @@ def _final_step_guard_observation(tool_name: str) -> dict[str, object]:
     }
 
 
+def _repeatable_call_identity(
+    call: ModelToolCall,
+    tools: ToolRegistry,
+) -> tuple[str, dict[str, object]] | None:
+    spec = tools.specs.get(call.name)
+    if spec is None or spec.is_terminal or call.name in {"explore", "commit_evidence_plan"}:
+        return None
+    try:
+        raw_arguments = json.loads(call.arguments or "{}")
+        if not isinstance(raw_arguments, dict):
+            return None
+        validated = spec.input_model.model_validate(raw_arguments)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    normalized = validated.model_dump(mode="json")
+    fingerprint = json.dumps(
+        {"tool": call.name, "arguments": normalized},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return fingerprint, normalized
+
+
+def _repeated_call_observation(
+    *,
+    tool_name: str,
+    repeat_count: int,
+    first_step: int,
+    previous_step: int,
+) -> dict[str, object]:
+    return {
+        "ok": False,
+        "tool": tool_name,
+        "content": {
+            "error": {
+                "code": "REPEATED_IDENTICAL_TOOL_CALL",
+                "message": (
+                    "Identical call blocked after two consecutive attempts. Reuse the previous "
+                    "observations instead of retrying unchanged. Review the available evidence, "
+                    "Explorer report, or current plan, then change the arguments, source, or "
+                    "approach—or submit the best supported answer."
+                ),
+                "recoverable": True,
+                "do_not_retry_same_call": True,
+            },
+            "repeat_count": repeat_count,
+            "first_step": first_step,
+            "previous_step": previous_step,
+        },
+    }
+
+
 def _answer_verification_event_payload(
     *,
     call: ModelToolCall,
@@ -657,6 +710,10 @@ class ReActAgent:
         evidence_plan_commit_attempts = 0
         evidence_plan_answer_blocks = 0
         observed_verifications: set[tuple[str, str]] = set()
+        last_call_fingerprint: str | None = None
+        repeated_call_count = 0
+        repeated_call_first_step = 0
+        previous_identical_call_step = 0
         self.evidence_plan = None
         step_index = 1
 
@@ -831,6 +888,69 @@ class ReActAgent:
                 finalization_retry_pending = True
                 step_index += 1
                 continue
+
+            call_identity = _repeatable_call_identity(call, active_tools)
+            normalized_call_input: dict[str, object] = {}
+            if call_identity is None:
+                last_call_fingerprint = None
+                repeated_call_count = 0
+                repeated_call_first_step = 0
+                previous_identical_call_step = 0
+            else:
+                call_fingerprint, normalized_call_input = call_identity
+                if call_fingerprint == last_call_fingerprint:
+                    repeated_call_count += 1
+                else:
+                    last_call_fingerprint = call_fingerprint
+                    repeated_call_count = 1
+                    repeated_call_first_step = step_index
+
+                if repeated_call_count >= 3:
+                    observation = _repeated_call_observation(
+                        tool_name=call.name,
+                        repeat_count=repeated_call_count,
+                        first_step=repeated_call_first_step,
+                        previous_step=previous_identical_call_step,
+                    )
+                    messages.append(_tool_message(call, observation))
+                    emit_event(
+                        self.event_sink,
+                        "repeated_identical_tool_call_blocked",
+                        {
+                            "step_index": step_index,
+                            "tool_call_id": call.id,
+                            "blocked_tool": call.name,
+                            "repeat_count": repeated_call_count,
+                            "first_step": repeated_call_first_step,
+                            "previous_step": previous_identical_call_step,
+                        },
+                    )
+                    step_record = StepRecord(
+                        step_index=step_index,
+                        thought=response.content,
+                        action=call.name,
+                        action_input=normalized_call_input,
+                        raw_response=response.raw_response,
+                        observation=observation,
+                        ok=False,
+                        tool_call_id=call.id,
+                        finish_reason=response.finish_reason,
+                    )
+                    state.steps.append(step_record)
+                    emit_event(
+                        self.event_sink,
+                        "step_completed",
+                        {
+                            "step_index": step_index,
+                            "step": step_record.to_dict(),
+                        },
+                    )
+                    previous_identical_call_step = step_index
+                    if finalization_retry:
+                        break
+                    step_index += 1
+                    continue
+                previous_identical_call_step = step_index
 
             emit_event(
                 self.event_sink,

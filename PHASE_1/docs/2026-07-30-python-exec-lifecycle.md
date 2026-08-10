@@ -41,6 +41,20 @@ Python 执行进程改为显式使用 `multiprocessing.get_context("spawn")`，�
 关闭会立即使父进程返回“exited without returning a result”，不会等待完整任务预算。
 该改造只隔离进程生命周期，不把 `execute_python` 描述为操作系统安全沙箱。
 
+## stdout/stderr 返回边界
+
+进程生命周期有界并不等于返回给模型的 observation 有界。Python 子进程仍可把任意体积的
+stdout 或 stderr 写入临时文件；如果父进程把文件完整读回，单次工具结果就可能挤满下一轮
+模型请求。因此，运行时现在分别将返回的 stdout 和 stderr 限制为 64 KiB。小于上限的输出
+保持原有结构和内容；超过上限时保留开头与结尾，中间插入显式截断标记，并在顶层返回
+`truncated: true` 和 `capture.output`、`capture.stderr` 元数据，其中包括原始、返回和省略的
+字节数。
+
+上限只作用于父进程返回的 observation，不在子进程写出时提前关闭 stdout/stderr，也不改变
+30 秒执行上限、Pipe 结果回传、异常 traceback 或 terminate/kill 回收路径。按字节取首尾时会
+避开 UTF-8 字符边界，避免因为截断人为产生替换字符。自动化测试覆盖小输出结构不变、stdout
+与 stderr 独立截断、UTF-8 边界、截断后异常回传，以及下一轮模型请求收到有界 observation。
+
 ## 自动化验证
 
 新增单元测试覆盖：

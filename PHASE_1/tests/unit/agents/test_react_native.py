@@ -15,6 +15,7 @@ from data_agent_baseline.config import (
     RunConfig,
 )
 from data_agent_baseline.run.runner import run_benchmark
+from data_agent_baseline.tools.python_exec import PYTHON_CAPTURE_STREAM_MAX_BYTES
 from data_agent_baseline.tools.registry import (
     ToolRegistry,
     ToolSpec,
@@ -113,6 +114,151 @@ def test_runs_native_tool_loop_and_replays_matching_call_id(tmp_path):
         payload for kind, payload in events if kind == "answer_verification_passed"
     )
     assert verification_passed["tool_call_id"] == "call_answer_one"
+
+
+def test_next_model_request_receives_bounded_python_observation(tmp_path):
+    model = ScriptedModelAdapter(
+        [
+            _tool_response(
+                "execute_python",
+                {"code": "print('HEAD-' + ('x' * 200_000) + '-TAIL')"},
+                call_id="call_python_large",
+            ),
+            _answer_response(),
+        ]
+    )
+    agent = ReActAgent(model=model, tools=create_default_tool_registry())
+
+    result = agent.run(_task(tmp_path))
+
+    assert result.succeeded is True
+    observation = json.loads(model.requests[1][-1].content)
+    content = observation["content"]
+    assert content["truncated"] is True
+    assert content["output"].startswith("HEAD-")
+    assert content["output"].endswith("-TAIL\n")
+    returned_bytes = content["capture"]["output"]["returned_bytes"]
+    assert returned_bytes <= PYTHON_CAPTURE_STREAM_MAX_BYTES
+
+
+def test_blocks_third_consecutive_identical_tool_call_before_handler(tmp_path):
+    base_tools = create_default_tool_registry()
+    read_spec = base_tools.specs["read_csv"]
+    handler_calls = 0
+
+    def counting_handler(task, action_input):
+        nonlocal handler_calls
+        handler_calls += 1
+        return read_spec.handler(task, action_input)
+
+    specs = dict(base_tools.specs)
+    specs["read_csv"] = ToolSpec(
+        name=read_spec.name,
+        description=read_spec.description,
+        input_model=read_spec.input_model,
+        handler=counting_handler,
+        is_terminal=read_spec.is_terminal,
+    )
+    model = ScriptedModelAdapter(
+        [
+            _tool_response(
+                "read_csv",
+                '{"path":"data.csv","max_rows":1}',
+                call_id="call_read_first",
+            ),
+            _tool_response(
+                "read_csv",
+                '{"max_rows":1,"path":"data.csv"}',
+                call_id="call_read_second",
+            ),
+            _tool_response(
+                "read_csv",
+                {"path": "data.csv", "max_rows": 1},
+                call_id="call_read_blocked",
+            ),
+            _answer_response(),
+        ]
+    )
+    events = []
+    agent = ReActAgent(
+        model=model,
+        tools=ToolRegistry(specs=specs),
+        event_sink=lambda event_type, payload: events.append((event_type, payload)),
+    )
+
+    result = agent.run(_task(tmp_path))
+
+    assert result.succeeded is True
+    assert handler_calls == 2
+    blocked = result.steps[2]
+    assert blocked.ok is False
+    assert blocked.tool_call_id == "call_read_blocked"
+    assert blocked.observation["content"]["error"] == {
+        "code": "REPEATED_IDENTICAL_TOOL_CALL",
+        "message": (
+            "Identical call blocked after two consecutive attempts. Reuse the previous "
+            "observations instead of retrying unchanged. Review the available evidence, "
+            "Explorer report, or current plan, then change the arguments, source, or "
+            "approach—or submit the best supported answer."
+        ),
+        "recoverable": True,
+        "do_not_retry_same_call": True,
+    }
+    assert blocked.observation["content"]["repeat_count"] == 3
+    assert blocked.observation["content"]["first_step"] == 1
+    assert blocked.observation["content"]["previous_step"] == 2
+    assert model.requests[3][-1].tool_call_id == "call_read_blocked"
+    assert not any(
+        kind == "tool_started" and payload["tool_call_id"] == "call_read_blocked"
+        for kind, payload in events
+    )
+    guard = next(
+        payload for kind, payload in events if kind == "repeated_identical_tool_call_blocked"
+    )
+    assert guard["blocked_tool"] == "read_csv"
+    assert guard["repeat_count"] == 3
+
+
+def test_different_tool_arguments_reset_consecutive_call_count(tmp_path):
+    base_tools = create_default_tool_registry()
+    list_spec = base_tools.specs["list_context"]
+    handler_calls = 0
+
+    def counting_handler(task, action_input):
+        nonlocal handler_calls
+        handler_calls += 1
+        return list_spec.handler(task, action_input)
+
+    specs = dict(base_tools.specs)
+    specs["list_context"] = ToolSpec(
+        name=list_spec.name,
+        description=list_spec.description,
+        input_model=list_spec.input_model,
+        handler=counting_handler,
+        is_terminal=list_spec.is_terminal,
+    )
+    model = ScriptedModelAdapter(
+        [
+            _tool_response("list_context", {"max_depth": 2}, call_id="call_list_1"),
+            _tool_response("list_context", {"max_depth": 2}, call_id="call_list_2"),
+            _tool_response("list_context", {"max_depth": 1}, call_id="call_list_3"),
+            _tool_response("list_context", {"max_depth": 2}, call_id="call_list_4"),
+            _answer_response(),
+        ]
+    )
+    events = []
+    agent = ReActAgent(
+        model=model,
+        tools=ToolRegistry(specs=specs),
+        event_sink=lambda event_type, payload: events.append((event_type, payload)),
+    )
+
+    result = agent.run(_task(tmp_path))
+
+    assert result.succeeded is True
+    assert handler_calls == 4
+    assert all(step.ok for step in result.steps)
+    assert not any(kind == "repeated_identical_tool_call_blocked" for kind, _ in events)
 
 
 def test_budget_reminders_are_injected_once_before_steps_15_and_19(tmp_path):
