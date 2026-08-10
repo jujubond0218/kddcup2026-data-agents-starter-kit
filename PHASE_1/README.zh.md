@@ -12,6 +12,11 @@
 
 > 面向 KDD Cup 2026 DataAgent-Bench 挑战的官方 starter kit。仓库默认读取 `data/public/input/`，并为后续评测生成预测结果。
 
+> [!NOTE]
+> 本 Fork 在 Phase 1 增加了本地评测、运行可靠性、原生工具协议、Explorer、答案校验和
+> Evidence Plan；统一入口见[工程与实验索引](docs/README.md)。公开题本地 benchmark
+> 结果不等同于官方隐藏榜成绩。
+
 ## Overview
 
 | 项目 | 内容 |
@@ -295,20 +300,14 @@ uv run dabench score-run artifacts/runs/<run_id> \
 命令默认在运行目录中写入 `scores.json`。评分公式、归一化规则和部分任务运行的解释见
 [`docs/evaluation.md`](docs/evaluation.md)。
 
-本次运行可靠性改造的动机、实现变化和脱敏耗时对比记录在
-[`docs/2026-07-24-runner-reliability.md`](docs/2026-07-24-runner-reliability.md)。
-原生工具协议、参数校验、Trace 兼容策略和验证结果记录在
-[`docs/2026-07-24-native-tool-calling.md`](docs/2026-07-24-native-tool-calling.md)。
-确定性的提交前校验和纠错流程见
-[`docs/2026-07-24-answer-verification.md`](docs/2026-07-24-answer-verification.md)。
-受限 Explorer 的设计、预算、失败回退和评测边界见
-[`docs/2026-07-27-context-explorer.md`](docs/2026-07-27-context-explorer.md)。
-步数预算提醒、最终步骤守卫、Trace 语义和定向 bad case 实验方案见
-[`docs/2026-07-31-step-budget-stop-guard.md`](docs/2026-07-31-step-budget-stop-guard.md)。
+本地评测、Runner/Python 可靠性、原生工具调用、可恢复错误、有界 Explorer、答案校验、
+步数收尾和 Evidence Plan 消融等设计记录，统一整理在
+[工程与实验索引](docs/README.md)。
 
 ## Contact
 
-- 问题反馈： https://github.com/HKUSTDial/kddcup2026-data-agents-starter-kit/issues
+- 个人 Fork 问题反馈：https://github.com/jujubond0218/kddcup2026-data-agents-starter-kit/issues
+- 官方上游：https://github.com/HKUSTDial/kddcup2026-data-agents-starter-kit
 - 官方网站： https://dataagent.top
 - Discord： https://discord.com/invite/7eFwJQN3Fx
 - 微信公众号：`数据智能与分析实验室 DIAL`

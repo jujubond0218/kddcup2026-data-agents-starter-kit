@@ -1,6 +1,6 @@
 <div align="center">
 
-# KDD Cup 2026 DataAgent-Bench Starter Kit
+# KDD Cup 2026 DataAgent-Bench — Phase 1 工程化 Fork
 
 [English](README.md) | 中文
 
@@ -9,7 +9,45 @@
 
 </div>
 
-本仓库提供 KDD Cup 2026 DataAgent-Bench 的 baseline starter kit。仓库按比赛阶段组织，参赛者可以根据自己正在使用的数据格式进入对应目录。
+> [!NOTE]
+> 本仓库是
+> [KDD Cup 2026 官方 Starter Kit](https://github.com/HKUSTDial/kddcup2026-data-agents-starter-kit)
+> 的个人研究 Fork。个人改造仅覆盖 Phase 1，Phase 2 保持官方基线；项目来源和范围见
+> [NOTICE.md](NOTICE.md)。
+
+本项目将教学型 Phase 1 ReAct baseline 改造成可复现的数据分析 Agent 实验系统，处理
+CSV、JSON、SQLite、Markdown、文本和文本型 PDF 等异构输入。核心价值是建立完整的工程
+闭环，并明确区分运行成功、协议正确、过程可审计和答案语义正确四类指标。
+
+## Phase 1 核心改造
+
+| 方向 | 个人改造 | 验证结果 |
+| --- | --- | --- |
+| 原生工具协议 | 将文本 JSON action 迁移为 OpenAI-compatible `tools/tool_calls`，增加 Pydantic 严格校验、call ID 对齐和可恢复工具 observation。 | 12 题回归中额外答案列由 11 个降至 1 个；12/12 次目标路径/类型错误在下一轮完成纠正。 |
+| 可靠执行 | 增加请求重试、任务子进程硬超时、实时事件、断点续跑，以及 `spawn + Pipe` 的 Python 生命周期。 | 历史 600 秒卡死任务缩短至约 18–29 秒并保留诊断；一次 50 题实验中 136/136 次 Python 调用完整返回。 |
+| 有界规划与核验 | 增加确定性文件 Inventory、有界 Explorer、Answer Verifier、步数守卫和可选 Evidence Plan 协议。 | Evidence Plan 提交率由 14.8% 提升至 72.4%，声明核验观测率达到 92%–93.5%；不将过程指标描述为稳定语义提分。 |
+| 可复现实验 | 增加本地 scorer、固定回归集、Scripted 测试、实验记录和明确的 go/no-go 条件。 | 公开 50 题本地分数从初始 0.4840 到单轮最高 0.7237；主线三轮参考均值为 0.6869。 |
+
+以上分数均来自公开 50 题的本地 benchmark，不是官方隐藏榜成绩。单轮最高值只是一项
+观测结果，不能据此把全部提升归因于某一个改造。
+
+```text
+任务与异构上下文
+→ 有界 Explorer / 证据地图
+→ 原生工具调用 ReAct Agent
+→ 数据工具与隔离的 Python 执行
+→ 确定性答案校验
+→ prediction + 实时 events + trace
+→ 本地评分与回归分析
+```
+
+实现细节、实验口径与负结果边界统一从
+[Phase 1 文档索引](PHASE_1/docs/README.md)进入。
+
+## 官方 Starter Kit
+
+官方仓库提供 KDD Cup 2026 DataAgent-Bench 的 baseline starter kit，并按比赛阶段组织，
+参赛者可以根据正在使用的数据格式进入对应目录。
 
 ## 仓库结构
 
@@ -72,62 +110,21 @@ uv.lock                           # 锁定的依赖版本
 - 本地运行产物请放在 `artifacts/` 下；这些文件不应提交到仓库。
 - 在打包或提交方案前，请先阅读对应阶段目录下的 README。
 
-## 工程记录
+## 文档与支持
 
-- [2026-07-23：Phase 1 本地评测链路改造](PHASE_1/docs/2026-07-23-phase1-evaluation-pipeline.md)
-- [2026-07-24：Phase 1 运行可靠性与实验反馈周期改造](PHASE_1/docs/2026-07-24-runner-reliability.md)
-- [2026-07-24：Phase 1 原生工具调用改造](PHASE_1/docs/2026-07-24-native-tool-calling.md)
-- [2026-07-24：Phase 1 确定性答案验证](PHASE_1/docs/2026-07-24-answer-verification.md)
-- [2026-07-27：Phase 1 受限 Context Explorer](PHASE_1/docs/2026-07-27-context-explorer.md)
+- 个人 Fork 问题反馈：https://github.com/jujubond0218/kddcup2026-data-agents-starter-kit/issues
+- Phase 1 使用说明：[PHASE_1/README.zh.md](PHASE_1/README.zh.md)
+- 工程与实验索引：[PHASE_1/docs/README.md](PHASE_1/docs/README.md)
+- 项目来源说明：[NOTICE.md](NOTICE.md)
+- 官方仓库与比赛支持：
+  [HKUSTDial Starter Kit](https://github.com/HKUSTDial/kddcup2026-data-agents-starter-kit)、
+  [官方网站](https://dataagent.top)和
+  [Discord](https://discord.com/invite/7eFwJQN3Fx)
 
-## 联系方式
+## 官方基线模块
 
-- 问题反馈： https://github.com/HKUSTDial/kddcup2026-data-agents-starter-kit/issues
-- 官方网站： https://dataagent.top
-- Discord： https://discord.com/invite/7eFwJQN3Fx
-- 微信公众号：`数据智能与分析实验室 DIAL`
-
-<div align="center">
-  <table>
-    <tr>
-      <td align="center">
-        <a href="https://dataagent.top">
-          <img
-            src="https://api.qrserver.com/v1/create-qr-code/?size=144x144&data=https://dataagent.top&bgcolor=ffffff&color=111827&margin=8"
-            alt="Official website QR code"
-            width="144"
-          />
-        </a>
-        <br />
-        官方网站
-      </td>
-      <td align="center">
-        <a href="https://discord.com/invite/7eFwJQN3Fx">
-          <img
-            src="https://api.qrserver.com/v1/create-qr-code/?size=144x144&data=https://discord.com/invite/7eFwJQN3Fx&bgcolor=ffffff&color=111827&margin=8"
-            alt="Discord QR code"
-            width="144"
-          />
-        </a>
-        <br />
-        Discord
-      </td>
-      <td align="center">
-        <img
-          src="https://dataagent.top/HKUSTGZ_DIAL.jpg"
-          alt="WeChat official account QR code"
-          width="144"
-        />
-        <br />
-        微信公众号
-      </td>
-    </tr>
-  </table>
-</div>
-
-## 主要模块
-
-每个阶段目录内部使用相同的 baseline 结构。例如进入 `PHASE_1/` 或 `PHASE_2/` 后，核心模块包括：
+以下结构来自两个阶段共用的官方基线；当前 Phase 1 的完整模块与工具说明见
+[PHASE_1/README.zh.md](PHASE_1/README.zh.md)。
 
 | 模块 | 责任 |
 | --- | --- |
