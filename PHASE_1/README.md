@@ -109,6 +109,12 @@ explorer:
   max_preview_chars: 2000
   max_inventory_chars: 12000
   max_report_chars: 4000
+
+evidence_plan:
+  enabled: false
+  max_commit_attempts: 2
+  strict_keys: true
+  verification_gate: true
 ```
 
 Config fields:
@@ -131,6 +137,10 @@ Config fields:
 | `explorer.enabled` | Exposes one argument-free `explore({})` call on the main Agent's first turn. Deterministic Inventory and knowledge evidence are built inside the tool. |
 | `explorer.max_steps` | Explorer model-request ceiling. The default and effective hard limit are two: report immediately or request one targeted follow-up, then report only. Larger legacy values still parse but do not reopen an exploration loop. |
 | `explorer.max_duration_seconds` | Explorer soft wall-clock limit. On expiry, successful evidence is converted into a bounded fallback data map before the task-level hard timeout. |
+| `evidence_plan.enabled` | When true, the main Agent must first commit one deterministic evidence plan after `explore` reports an unresolved requirement or uncertainty. Default false; the feature never reads gold or judges answer semantics. |
+| `evidence_plan.max_commit_attempts` | Invalid-plan or protocol-error budget while the plan is pending (1 or 2). A normal-tool call made during the pending phase is corrected without consuming this budget. |
+| `evidence_plan.strict_keys` | Default true. Each pending requirement ID becomes a required key in the dynamic schema; missing or extra keys fail argument validation. False is retained only for the Option A ablation. |
+| `evidence_plan.verification_gate` | Default true. After a plan commits, the first answer with unobserved successful `tool + path` checks is rejected once when the step budget permits. False is retained only for the A+B ablation. |
 
 ## CLI
 

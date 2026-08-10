@@ -25,6 +25,7 @@ def build_system_prompt(
     *,
     explore_available: bool = False,
     explore_required: bool = False,
+    evidence_plan_enabled: bool = False,
 ) -> str:
     prompt = system_prompt or REACT_SYSTEM_PROMPT
     if explore_available:
@@ -42,6 +43,17 @@ def build_system_prompt(
             "unless an anchored rule requires a transformation; derived columns may use the "
             "declared operation. Never output answer_projection.helper_fields used only for "
             "filtering, joining, sorting, or grouping."
+        )
+    if evidence_plan_enabled:
+        prompt += (
+            "\n9. While `commit_evidence_plan` is exposed, it is the only tool available "
+            "and the plan is still pending. Commit a deterministic plan covering every "
+            "pending requirement and uncertainty from the explore report. If the plan is "
+            "rejected, fix it according to the error message and retry until it is "
+            "accepted or the runtime fails open. After it succeeds, prioritize executing "
+            "the declared verification actions (exact tool and context path) with the "
+            "normal tools. Complete the declared verification actions before submitting "
+            "the answer when the step budget permits."
         )
     return prompt
 

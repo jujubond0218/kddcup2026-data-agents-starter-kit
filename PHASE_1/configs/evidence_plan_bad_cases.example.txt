@@ -1,0 +1,13 @@
+# Evidence Plan target tasks: one unresolved semantic route that oscillates
+# between full and zero score across the PR9 50-task runs. This file is used
+# only for the evidence-plan experiment; the runtime never branches on task ID.
+task_25
+task_86
+task_89
+task_163
+task_173
+task_180
+task_194
+task_196
+task_257
+task_352
