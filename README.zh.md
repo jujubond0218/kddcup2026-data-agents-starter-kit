@@ -25,6 +25,7 @@ CSV、JSON、SQLite、Markdown、文本和文本型 PDF 等异构输入。核心
 | --- | --- | --- |
 | 原生工具协议 | 将文本 JSON action 迁移为 OpenAI-compatible `tools/tool_calls`，增加 Pydantic 严格校验、call ID 对齐和可恢复工具 observation。 | 12 题回归中额外答案列由 11 个降至 1 个；12/12 次目标路径/类型错误在下一轮完成纠正。 |
 | 可靠执行 | 增加请求重试、任务子进程硬超时、实时事件、断点续跑，以及 `spawn + Pipe` 的 Python 生命周期。 | 历史 600 秒卡死任务缩短至约 18–29 秒并保留诊断；一次 50 题实验中 136/136 次 Python 调用完整返回。 |
+| 有界答案数据面 | 大结果由 Python 写入 attempt 独有的 CSV artifact，再通过固定 handle 提交；小结果继续内联并复用同一 Verifier。 | 三轮四题目标集共 4 次真实 140–454 行 artifact 与 `prediction.csv` 值完全一致；校验后的终局参数由等价内联的 5.4–13.7 KB 降为 48 字节。该结论只证明目标集协议，不代表 50 题准确率提升。 |
 | 有界规划与核验 | 增加确定性文件 Inventory、有界 Explorer、Answer Verifier、步数守卫和可选 Evidence Plan 协议。 | Evidence Plan 提交率由 14.8% 提升至 72.4%，声明核验观测率达到 92%–93.5%；不将过程指标描述为稳定语义提分。 |
 | 可复现实验 | 增加本地 scorer、固定回归集、Scripted 测试、实验记录和明确的 go/no-go 条件。 | 公开 50 题本地分数从初始 0.4840 到单轮最高 0.7237；主线三轮参考均值为 0.6869。 |
 
@@ -36,6 +37,7 @@ CSV、JSON、SQLite、Markdown、文本和文本型 PDF 等异构输入。核心
 → 有界 Explorer / 证据地图
 → 原生工具调用 ReAct Agent
 → 数据工具与隔离的 Python 执行
+→ 有界内联 / CSV artifact 答案交付
 → 确定性答案校验
 → prediction + 实时 events + trace
 → 本地评分与回归分析

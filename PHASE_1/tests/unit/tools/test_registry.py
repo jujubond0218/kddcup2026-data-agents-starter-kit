@@ -73,7 +73,8 @@ def test_default_registry_renders_openai_json_schemas():
     assert "ONLY the columns explicitly requested" in answer["function"]["description"]
     assert "Extra columns are penalized" in answer["function"]["description"]
     assert answer["function"]["parameters"]["examples"] == [
-        {"columns": ["average_long_shots"], "rows": [["63.5"]]}
+        {"columns": ["average_long_shots"], "rows": [["63.5"]]},
+        {"from_csv": "answer.csv"},
     ]
     assert "join keys" in answer["function"]["parameters"]["properties"]["columns"]["description"]
 

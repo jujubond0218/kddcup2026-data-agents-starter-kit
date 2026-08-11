@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import contextlib
 import io
 import multiprocessing
@@ -15,6 +16,7 @@ PYTHON_PROCESS_START_METHOD = "spawn"
 PROCESS_STOP_GRACE_SECONDS = 1.0
 PYTHON_CAPTURE_STREAM_MAX_BYTES = 64 * 1024
 _TRUNCATION_MARKER_TEMPLATE = "\n... [TRUNCATED: {omitted_bytes} bytes omitted] ...\n"
+ANSWER_CSV_PATH_NAME = "answer_csv_path"
 
 
 @contextlib.contextmanager
@@ -165,6 +167,7 @@ def _run_python_code(
     code: str,
     stdout_path: str,
     stderr_path: str,
+    answer_csv_path: str | None,
     result_connection: Connection,
 ) -> None:
     namespace: dict[str, Any] = {
@@ -173,6 +176,8 @@ def _run_python_code(
         "context_root": context_root,
         "Path": Path,
     }
+    if answer_csv_path is not None:
+        namespace["answer_csv_path"] = Path(answer_csv_path)
     resolved_stdout_path = Path(stdout_path)
     resolved_stderr_path = Path(stderr_path)
 
@@ -236,11 +241,25 @@ def _captured_result(
     return result
 
 
+def _assigns_reserved_answer_csv_path(code: str) -> bool:
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return False
+    return any(
+        isinstance(node, ast.Name)
+        and node.id == ANSWER_CSV_PATH_NAME
+        and isinstance(node.ctx, (ast.Store, ast.Del))
+        for node in ast.walk(tree)
+    )
+
+
 def execute_python_code(
     context_root: Path,
     code: str,
     *,
     timeout_seconds: float = 30,
+    answer_csv_path: Path | None = None,
 ) -> dict[str, Any]:
     resolved_context_root = context_root.resolve()
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -248,6 +267,17 @@ def execute_python_code(
         stderr_path = Path(temp_dir) / "stderr.txt"
         stdout_path.write_text("")
         stderr_path.write_text("")
+
+        if answer_csv_path is not None and _assigns_reserved_answer_csv_path(code):
+            return _captured_result(
+                stdout_path,
+                stderr_path,
+                success=False,
+                error=(
+                    "answer_csv_path is a predefined Path and cannot be assigned or deleted. "
+                    "Write the complete CSV directly to it."
+                ),
+            )
 
         process_context = multiprocessing.get_context(PYTHON_PROCESS_START_METHOD)
         parent_connection, child_connection = process_context.Pipe(duplex=False)
@@ -258,6 +288,7 @@ def execute_python_code(
                 code,
                 stdout_path.as_posix(),
                 stderr_path.as_posix(),
+                answer_csv_path.resolve().as_posix() if answer_csv_path else None,
                 child_connection,
             ),
         )

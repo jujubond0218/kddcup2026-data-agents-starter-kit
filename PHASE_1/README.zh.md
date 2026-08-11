@@ -216,7 +216,9 @@ Explorer 是唯一的局部例外：运行时先确定性、有界地扫描全�
 Inventory 无法判断关键来源或字段时，才允许一次定向补查，第二次请求只开放 `report`。
 补查仍使用原始 call ID 接收 observation。
 `answer` 调用还必须通过确定性的 CSV 安全校验才能终止任务；被拒绝的候选答案会收到可恢复
-的工具观察，以便模型修正后重提。
+的工具观察，以便模型修正后重提。小答案继续内联提交 `columns/rows`；达到 20 行或 100 个
+数据单元格的结果，必须由 `execute_python` 写入当前 attempt 独有的 `answer_csv_path`，再用
+固定 `answer.csv` handle 提交，避免模型在终局工具参数中重新生成全部数据行。
 主 Agent 在正常步数使用达到 70% 和 90% 后会分别收到一次预算提醒。Explorer 已完成时，
 若最后一个正常步骤仍调用非终止工具，运行时不会执行该工具，而是使用原始 call ID 返回
 `FINAL_STEP_REQUIRES_ANSWER`，随后只开放 `answer` 并额外请求模型一次。该收尾请求不会
@@ -233,10 +235,12 @@ Inventory 无法判断关键来源或字段时，才允许一次定向补查，�
 | `read_doc` | 读取文本文档预览。 | `path`、`max_chars` |
 | `inspect_sqlite_schema` | 查看 SQLite / DB 文件中的表结构。 | `path` |
 | `execute_context_sql` | 对 `context/` 内 SQLite / DB 文件执行只读 SQL。 | `path`、`sql`、`limit` |
-| `execute_python` | 在干净启动的子进程中执行任务 `context/` 目录内的 Python 代码，固定执行上限为 30 秒，并采用有界进程回收。返回的 stdout、stderr 各自最多 64 KiB；截断时保留开头、结尾和字节数元数据。这种生命周期隔离不等于操作系统安全沙箱。 | `code` |
-| `answer` | 提交最终答案表格并结束当前任务。 | `columns`、`rows` |
+| `execute_python` | 在干净启动的子进程中执行任务 `context/` 目录内的 Python 代码，固定执行上限为 30 秒，并采用有界进程回收。返回的 stdout、stderr 各自最多 64 KiB；截断时保留开头、结尾和字节数元数据。每个 attempt 还会提供固定 `answer_csv_path`，用于写入最大 5 MiB 的完整答案 artifact。这种生命周期隔离不等于操作系统安全沙箱。 | `code` |
+| `answer` | 提交最终答案表格并结束当前任务；内联模式与 artifact 模式严格互斥。 | `columns`、`rows`，或 `from_csv: "answer.csv"` |
 
-所有文件路径都必须是相对于任务 `context/` 目录的相对路径。
+输入读取路径仍必须是相对于任务 `context/` 目录的相对路径。生成答案使用独立 capability
+root：Python 只能写 Runner 提供的 `answer_csv_path`，`answer.from_csv` 只接受当前 attempt
+内的固定相对 handle `answer.csv`，不能引用任意绝对路径或 `context/` 输入文件。
 主工具的可恢复文件错误会返回结构化纠错信息：路径不存在使用 `PATH_NOT_FOUND`，提示
 调用 `list_context` 或复用 Explorer 报告中的精确路径；SQL/schema 工具收到非 SQLite
 文件时使用 `NOT_SQLITE`，并根据文件类型建议对应读取工具。两类错误都标记

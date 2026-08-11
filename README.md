@@ -26,6 +26,7 @@ protocol correctness, auditability, and semantic answer quality.
 | --- | --- | --- |
 | Native tool protocol | Replaced text JSON actions with OpenAI-compatible `tools/tool_calls`, strict Pydantic validation, matched call IDs, and recoverable tool observations. | In a 12-task regression, extra answer columns fell from 11 to 1; 12/12 targeted path/type errors were corrected on the next turn. |
 | Reliable execution | Added bounded request retries, task subprocess timeouts, live events, resume/retry, and a clean `spawn + Pipe` Python lifecycle. | Historical 600-second stalls completed in about 18–29 seconds with diagnostics; 136/136 Python calls returned in a 50-task run. |
+| Bounded answer data plane | Large final tables are written to an attempt-scoped CSV artifact and submitted through a fixed handle, while small answers stay inline and reuse the same verifier. | Across three repeated four-task runs, four real 140–454-row artifacts reached `prediction.csv` with exact value equality; normalized terminal arguments were 48 bytes instead of 5.4–13.7 KB inline equivalents. This is a target-set protocol result, not a 50-task accuracy claim. |
 | Bounded planning and verification | Added deterministic context inventory, a bounded Explorer, answer verification, step-budget guards, and an opt-in Evidence Plan protocol. | Evidence-plan submission rose from 14.8% to 72.4%; declared-verification observation reached 92%–93.5%, without claiming stable semantic gain. |
 | Reproducible evaluation | Added a local scorer, fixed regression selections, scripted tests, experiment records, and explicit go/no-go criteria. | Public 50-task local score: 0.4840 initial baseline, 0.7237 best single run; the repeated mainline reference averaged 0.6869 across three runs. |
 
@@ -38,6 +39,7 @@ Task + heterogeneous context
 → bounded Explorer / evidence map
 → native tool-calling ReAct agent
 → data tools and isolated Python execution
+→ bounded inline / CSV-artifact answer handoff
 → deterministic answer verification
 → prediction + live events + trace
 → local scorer and regression analysis
