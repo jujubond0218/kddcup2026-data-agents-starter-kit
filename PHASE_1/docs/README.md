@@ -17,7 +17,7 @@ auditability, and semantic answer quality are separate outcomes throughout these
 | Native tool protocol | [Native tool calling](2026-07-24-native-tool-calling.md), [tool error guidance](2026-07-30-tool-error-guidance.md), and [repeated-call guard](2026-08-10-repeated-tool-call-guard.md) | Defines strict schemas, call-ID alignment, recoverable observations, targeted error correction, and a bounded identical-call loop guard. |
 | Agent context | [Bounded Context Explorer](2026-07-27-context-explorer.md) | Builds a deterministic file inventory and a bounded semantic map with explicit unresolved items. |
 | Context observability | [Request input metrics](2026-08-10-request-input-metrics.md) | Measures each model request without persisting prompts, observations, schemas, or other raw content. |
-| Terminal correctness | [Answer verification](2026-07-24-answer-verification.md) and [step-budget stop guard](2026-07-31-step-budget-stop-guard.md) | Validates CSV safety and provides one bounded finalization opportunity without judging semantics. |
+| Terminal correctness | [Answer verification](2026-07-24-answer-verification.md), [large-answer artifact handoff](2026-08-11-answer-artifact-handoff.md), and [step-budget stop guard](2026-07-31-step-budget-stop-guard.md) | Validates CSV safety, moves large final tables out of model-generated tool arguments, and provides one bounded finalization opportunity without judging semantics. |
 | Auditable planning | [Evidence Plan](2026-08-07-evidence-plan.md) | Records Options A/B/C, protocol metrics, full-run ablations, and the boundary between observed checks and semantic proof. |
 
 ### How to interpret the results
@@ -45,7 +45,7 @@ auditability, and semantic answer quality are separate outcomes throughout these
 | 原生工具协议 | [原生工具调用](2026-07-24-native-tool-calling.md)、[工具错误引导](2026-07-30-tool-error-guidance.md)与[重复调用守卫](2026-08-10-repeated-tool-call-guard.md) | 定义严格 schema、call ID 对齐、可恢复 observation、目标错误纠正和有界的相同调用循环保护。 |
 | Agent 上下文 | [有界 Context Explorer](2026-07-27-context-explorer.md) | 生成确定性文件清单、有界语义地图和显式未解决问题。 |
 | 上下文可观测性 | [请求输入指标](2026-08-10-request-input-metrics.md) | 测量每次模型请求，但不持久化 Prompt、observation、schema 或其他原始内容。 |
-| 终局正确性 | [Answer Verifier](2026-07-24-answer-verification.md)与[步数停止守卫](2026-07-31-step-budget-stop-guard.md) | 校验 CSV 安全性并提供一次有界收尾，但不判断答案语义。 |
+| 终局正确性 | [Answer Verifier](2026-07-24-answer-verification.md)、[大结果 Artifact 交付](2026-08-11-answer-artifact-handoff.md)与[步数停止守卫](2026-07-31-step-budget-stop-guard.md) | 校验 CSV 安全性，将大表移出模型生成的终局参数，并提供一次有界收尾，但不判断答案语义。 |
 | 可审计规划 | [Evidence Plan](2026-08-07-evidence-plan.md) | 记录 A/B/C 三层协议、过程指标、50 题消融和“调用已发生不等于语义已证明”的边界。 |
 
 ### 实验结果应如何解释

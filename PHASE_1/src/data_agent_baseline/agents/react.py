@@ -963,6 +963,27 @@ class ReActAgent:
                 },
             )
             tool_result = active_tools.execute(task, call)
+            artifact_submission = bool(
+                call.name == "answer"
+                and tool_result.action_input
+                and tool_result.action_input.get("from_csv") == "answer.csv"
+            )
+            artifact_metadata = (
+                dict(tool_result.content)
+                if artifact_submission and tool_result.content.get("source") == "artifact"
+                else {}
+            )
+            detected_artifact = tool_result.content.get("answer_artifact")
+            if call.name == "execute_python" and isinstance(detected_artifact, dict):
+                emit_event(
+                    self.event_sink,
+                    "answer_artifact_detected",
+                    {
+                        "step_index": step_index,
+                        "tool_call_id": call.id,
+                        "byte_count": detected_artifact.get("byte_count"),
+                    },
+                )
             if exploration_pending and call.name == "explore":
                 exploration_pending = False
                 report = tool_result.content.get("report")
@@ -1009,6 +1030,33 @@ class ReActAgent:
                         tool_result=tool_result,
                         step_index=step_index,
                         answer_projection=answer_projection,
+                    )
+            if artifact_submission:
+                if tool_result.is_terminal:
+                    emit_event(
+                        self.event_sink,
+                        "answer_artifact_submitted",
+                        {
+                            "step_index": step_index,
+                            "tool_call_id": call.id,
+                            "byte_count": artifact_metadata.get("byte_count"),
+                            "row_count": artifact_metadata.get("row_count"),
+                            "column_count": artifact_metadata.get("column_count"),
+                            "sha256": artifact_metadata.get("sha256"),
+                        },
+                    )
+                else:
+                    emit_event(
+                        self.event_sink,
+                        "answer_artifact_rejected",
+                        {
+                            "step_index": step_index,
+                            "tool_call_id": call.id,
+                            "byte_count": artifact_metadata.get("byte_count"),
+                            "row_count": artifact_metadata.get("row_count"),
+                            "column_count": artifact_metadata.get("column_count"),
+                            "error_code": tool_result.error_code,
+                        },
                     )
             if (
                 not tool_result.is_terminal

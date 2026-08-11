@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import csv
 import json
 import multiprocessing
 import shutil
-from collections.abc import Callable
+import tempfile
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -100,6 +102,26 @@ def _write_csv(path: Path, columns: list[str], rows: list[list[Any]]) -> None:
             writer.writerow(row)
 
 
+@contextlib.contextmanager
+def _answer_artifact_attempt(
+    *,
+    task_output_dir: Path,
+    context_answer_path: Path,
+) -> Iterator[Path]:
+    context_answer_existed = context_answer_path.exists() or context_answer_path.is_symlink()
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix=".answer-artifact-",
+            dir=task_output_dir,
+        ) as artifact_dir:
+            yield Path(artifact_dir)
+    finally:
+        if not context_answer_existed and (
+            context_answer_path.is_file() or context_answer_path.is_symlink()
+        ):
+            context_answer_path.unlink(missing_ok=True)
+
+
 def _failure_run_result_payload(
     task_id: str,
     failure_reason: str,
@@ -126,12 +148,13 @@ def _run_single_task_core(
     model=None,
     tools: ToolRegistry | None = None,
     event_sink: EventSink | None = None,
+    artifact_root: Path | None = None,
 ) -> dict[str, Any]:
     public_dataset = DABenchPublicDataset(config.dataset.root_path)
     task = public_dataset.get_task(task_id)
 
     effective_model = model or build_model_adapter(config, event_sink=event_sink)
-    effective_tools = tools or create_default_tool_registry()
+    effective_tools = tools or create_default_tool_registry(artifact_root=artifact_root)
     if tools is None and config.explorer.enabled:
         explorer_config = ExplorerConfig(**asdict(config.explorer))
         specs = dict(effective_tools.specs)
@@ -163,6 +186,7 @@ def _run_single_task_in_subprocess(
     config: AppConfig,
     result_path: Path,
     events_path: Path,
+    artifact_root: Path,
 ) -> None:
     recorder = JsonlEventRecorder(events_path, task_id=task_id)
     recorder.emit("task_started", {"task_timeout_seconds": config.run.task_timeout_seconds})
@@ -171,6 +195,7 @@ def _run_single_task_in_subprocess(
             task_id=task_id,
             config=config,
             event_sink=recorder.emit,
+            artifact_root=artifact_root,
         )
         recorder.emit(
             "task_completed",
@@ -263,7 +288,10 @@ def _run_single_task_with_timeout(
     task_id: str,
     config: AppConfig,
     task_output_dir: Path,
-    worker_target: Callable[[str, AppConfig, Path, Path], None] = _run_single_task_in_subprocess,
+    artifact_root: Path,
+    worker_target: Callable[[str, AppConfig, Path, Path, Path], None] = (
+        _run_single_task_in_subprocess
+    ),
 ) -> dict[str, Any]:
     timeout_seconds = config.run.task_timeout_seconds
     events_path = task_output_dir / "events.jsonl"
@@ -277,11 +305,12 @@ def _run_single_task_with_timeout(
             task_id=task_id,
             config=config,
             event_sink=recorder.emit,
+            artifact_root=artifact_root,
         )
 
     process = multiprocessing.Process(
         target=worker_target,
-        args=(task_id, config, result_path, events_path),
+        args=(task_id, config, result_path, events_path, artifact_root),
     )
     process.start()
     process.join(timeout_seconds)
@@ -384,46 +413,53 @@ def run_single_task(
     task_output_dir = run_output_dir / task_id
     task_output_dir.mkdir(parents=True, exist_ok=True)
     events_path = task_output_dir / "events.jsonl"
-    if model is None and tools is None:
-        run_result = _run_single_task_with_timeout(
-            task_id=task_id,
-            config=config,
-            task_output_dir=task_output_dir,
-        )
-    else:
-        recorder = JsonlEventRecorder(events_path, task_id=task_id)
-        recorder.emit("task_started", {"task_timeout_seconds": None})
-        try:
-            run_result = _run_single_task_core(
+    context_answer_path = config.dataset.root_path / task_id / "context" / "answer.csv"
+    with _answer_artifact_attempt(
+        task_output_dir=task_output_dir,
+        context_answer_path=context_answer_path,
+    ) as artifact_root:
+        if model is None and tools is None:
+            run_result = _run_single_task_with_timeout(
                 task_id=task_id,
                 config=config,
-                model=model,
-                tools=tools,
-                event_sink=recorder.emit,
+                task_output_dir=task_output_dir,
+                artifact_root=artifact_root,
             )
-            recorder.emit(
-                "task_completed",
-                {
-                    "succeeded": bool(run_result.get("succeeded")),
-                    "failure_reason": run_result.get("failure_reason"),
-                },
-            )
-        except BaseException as exc:  # noqa: BLE001
-            recorder.emit(
-                "task_failed",
-                {
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                },
-            )
-            run_result = _failure_run_result_payload(
-                task_id,
-                f"Task failed with uncaught error: {exc}",
-                steps=_partial_steps_from_events(events_path),
-                diagnostics=_last_event_diagnostics(events_path),
-            )
-    run_result["e2e_elapsed_seconds"] = round(perf_counter() - started_at, 3)
-    return _write_task_outputs(task_id, run_output_dir, run_result)
+        else:
+            recorder = JsonlEventRecorder(events_path, task_id=task_id)
+            recorder.emit("task_started", {"task_timeout_seconds": None})
+            try:
+                run_result = _run_single_task_core(
+                    task_id=task_id,
+                    config=config,
+                    model=model,
+                    tools=tools,
+                    event_sink=recorder.emit,
+                    artifact_root=artifact_root,
+                )
+                recorder.emit(
+                    "task_completed",
+                    {
+                        "succeeded": bool(run_result.get("succeeded")),
+                        "failure_reason": run_result.get("failure_reason"),
+                    },
+                )
+            except BaseException as exc:  # noqa: BLE001
+                recorder.emit(
+                    "task_failed",
+                    {
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    },
+                )
+                run_result = _failure_run_result_payload(
+                    task_id,
+                    f"Task failed with uncaught error: {exc}",
+                    steps=_partial_steps_from_events(events_path),
+                    diagnostics=_last_event_diagnostics(events_path),
+                )
+        run_result["e2e_elapsed_seconds"] = round(perf_counter() - started_at, 3)
+        return _write_task_outputs(task_id, run_output_dir, run_result)
 
 
 def _load_task_artifacts(run_output_dir: Path, task_id: str) -> TaskRunArtifacts | None:

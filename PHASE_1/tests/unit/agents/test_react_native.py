@@ -141,6 +141,107 @@ def test_next_model_request_receives_bounded_python_observation(tmp_path):
     assert returned_bytes <= PYTHON_CAPTURE_STREAM_MAX_BYTES
 
 
+def test_artifact_rejection_can_be_rewritten_and_resubmitted(tmp_path):
+    artifact_root = tmp_path / "artifact"
+    artifact_root.mkdir()
+    model = ScriptedModelAdapter(
+        [
+            _tool_response(
+                "execute_python",
+                {
+                    "code": (
+                        "answer_csv_path.write_text('value,value\\none,two\\n', encoding='utf-8')"
+                    )
+                },
+                call_id="call_write_invalid",
+            ),
+            _tool_response(
+                "answer",
+                {"from_csv": "answer.csv"},
+                call_id="call_submit_invalid",
+            ),
+            _tool_response(
+                "execute_python",
+                {"code": ("answer_csv_path.write_text('value\\none\\n', encoding='utf-8')")},
+                call_id="call_rewrite",
+            ),
+            _tool_response(
+                "answer",
+                {"from_csv": "answer.csv"},
+                call_id="call_submit_valid",
+            ),
+        ]
+    )
+    events = []
+    agent = ReActAgent(
+        model=model,
+        tools=create_default_tool_registry(artifact_root=artifact_root),
+        event_sink=lambda event_type, payload: events.append((event_type, payload)),
+    )
+
+    result = agent.run(_task(tmp_path))
+
+    assert result.succeeded is True
+    assert result.answer is not None
+    assert result.answer.columns == ["value"]
+    assert result.answer.rows == [["one"]]
+    rejected_observation = model.requests[2][-1]
+    assert rejected_observation.tool_call_id == "call_submit_invalid"
+    assert json.loads(rejected_observation.content)["content"]["error"]["code"] == (
+        "ANSWER_VERIFICATION_ERROR"
+    )
+    assert [kind for kind, _ in events].count("answer_artifact_detected") == 2
+    rejected = next(payload for kind, payload in events if kind == "answer_artifact_rejected")
+    submitted = next(payload for kind, payload in events if kind == "answer_artifact_submitted")
+    assert rejected["tool_call_id"] == "call_submit_invalid"
+    assert rejected["error_code"] == "ANSWER_VERIFICATION_ERROR"
+    assert submitted["tool_call_id"] == "call_submit_valid"
+    assert submitted["row_count"] == 1
+    assert submitted["column_count"] == 1
+    assert len(submitted["sha256"]) == 64
+
+
+def test_python_artifact_observation_contains_metadata_not_rows(tmp_path):
+    artifact_root = tmp_path / "artifact"
+    artifact_root.mkdir()
+    model = ScriptedModelAdapter(
+        [
+            _tool_response(
+                "execute_python",
+                {
+                    "code": (
+                        "answer_csv_path.write_text('value\\n' + "
+                        "'\\n'.join(str(i) for i in range(10000)) + '\\n', "
+                        "encoding='utf-8')"
+                    )
+                },
+                call_id="call_write_large",
+            ),
+            _tool_response(
+                "answer",
+                {"from_csv": "answer.csv"},
+                call_id="call_submit_large",
+            ),
+        ]
+    )
+    agent = ReActAgent(
+        model=model,
+        tools=create_default_tool_registry(artifact_root=artifact_root),
+    )
+
+    result = agent.run(_task(tmp_path))
+
+    assert result.succeeded is True
+    assert result.answer is not None
+    assert len(result.answer.rows) == 10_000
+    observation = json.loads(model.requests[1][-1].content)["content"]
+    assert observation["output"] == ""
+    assert observation["answer_artifact"]["handle"] == "answer.csv"
+    assert observation["answer_artifact"]["byte_count"] > 0
+    assert "rows" not in observation["answer_artifact"]
+    assert len(json.dumps(result.steps[1].action_input).encode("utf-8")) < 100
+
+
 def test_blocks_third_consecutive_identical_tool_call_before_handler(tmp_path):
     base_tools = create_default_tool_registry()
     read_spec = base_tools.specs["read_csv"]

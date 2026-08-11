@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from functools import partial
+from pathlib import Path
 from typing import Any, Callable, Protocol, cast
 
 from pydantic import BaseModel, ValidationError
@@ -16,6 +18,16 @@ from data_agent_baseline.tools.contracts import (
     ReadCsvInput,
     ReadDocInput,
     ReadJsonInput,
+)
+from data_agent_baseline.tools.answer_artifact import (
+    ANSWER_ARTIFACT_HANDLE,
+    ANSWER_ARTIFACT_MAX_BYTES,
+    INLINE_ANSWER_MAX_CELLS_EXCLUSIVE,
+    INLINE_ANSWER_MAX_ROWS_EXCLUSIVE,
+    AnswerArtifactError,
+    answer_artifact_path,
+    inspect_answer_artifact,
+    load_answer_artifact,
 )
 from data_agent_baseline.tools.filesystem import (
     list_context_tree,
@@ -120,17 +132,87 @@ def _execute_context_sql(
     )
 
 
-def _execute_python(task: PublicTask, action_input: ExecutePythonInput) -> ToolExecutionResult:
+def _execute_python(
+    task: PublicTask,
+    action_input: ExecutePythonInput,
+    *,
+    artifact_root: Path | None = None,
+) -> ToolExecutionResult:
     content = execute_python_code(
         context_root=task.context_dir,
         code=action_input.code,
         timeout_seconds=EXECUTE_PYTHON_TIMEOUT_SECONDS,
+        answer_csv_path=(answer_artifact_path(artifact_root) if artifact_root else None),
     )
+    artifact = inspect_answer_artifact(artifact_root)
+    if artifact is not None:
+        content["answer_artifact"] = {
+            **artifact,
+            "guidance": (
+                f"Submit the complete file with answer(from_csv={ANSWER_ARTIFACT_HANDLE!r}); "
+                "do not print or copy its rows into the tool call."
+            ),
+        }
     return ToolExecutionResult(ok=bool(content.get("success")), content=content)
 
 
-def _answer(_: PublicTask, action_input: AnswerInput) -> ToolExecutionResult:
+def _answer(
+    _: PublicTask,
+    action_input: AnswerInput,
+    *,
+    artifact_root: Path | None = None,
+) -> ToolExecutionResult:
+    if action_input.from_csv is not None:
+        try:
+            loaded = load_answer_artifact(artifact_root, action_input.from_csv)
+        except AnswerArtifactError as exc:
+            return _tool_error(
+                code=exc.code,
+                message=str(exc),
+                guidance=(
+                    "answer_csv_path is a predefined Path; do not assign or replace it. "
+                    "Rewrite the complete CSV directly to that Path with one header row and "
+                    "equal-width data rows, then submit from_csv again."
+                ),
+                suggested_tools=["execute_python", "answer"],
+            )
+        return ToolExecutionResult(
+            ok=True,
+            content={"status": "submitted", "source": "artifact", **loaded.metadata},
+            is_terminal=True,
+            answer=loaded.answer,
+        )
+
+    existing_artifact = inspect_answer_artifact(artifact_root)
+    if existing_artifact is not None:
+        return _tool_error(
+            code="ANSWER_ARTIFACT_AVAILABLE",
+            message="answer.csv already exists for this attempt; submit the complete artifact.",
+            guidance=f"Call answer with only from_csv={ANSWER_ARTIFACT_HANDLE!r}.",
+            suggested_tools=["answer"],
+        )
+
     normalized_rows = [list(row) for row in action_input.rows]
+    row_count = len(normalized_rows)
+    cell_count = row_count * len(action_input.columns)
+    if (
+        row_count >= INLINE_ANSWER_MAX_ROWS_EXCLUSIVE
+        or cell_count >= INLINE_ANSWER_MAX_CELLS_EXCLUSIVE
+    ):
+        return _tool_error(
+            code="INLINE_ANSWER_TOO_LARGE",
+            message=(
+                "Inline answers must contain fewer than "
+                f"{INLINE_ANSWER_MAX_ROWS_EXCLUSIVE} rows and fewer than "
+                f"{INLINE_ANSWER_MAX_CELLS_EXCLUSIVE} data cells."
+            ),
+            guidance=(
+                "Use the predefined answer_csv_path without assigning or replacing it. Write "
+                "the complete table there with execute_python, "
+                f"then call answer with from_csv={ANSWER_ARTIFACT_HANDLE!r}."
+            ),
+            suggested_tools=["execute_python", "answer"],
+        )
     answer = AnswerTable(columns=list(action_input.columns), rows=normalized_rows)
     return ToolExecutionResult(
         ok=True,
@@ -310,19 +392,23 @@ class ToolRegistry:
         )
 
 
-def create_default_tool_registry() -> ToolRegistry:
+def create_default_tool_registry(*, artifact_root: Path | None = None) -> ToolRegistry:
     specs = {
         "answer": ToolSpec(
             name="answer",
             description=(
-                "Submit the final answer table and terminate the task. Submit ONLY "
+                "Submit the final answer table and terminate the task. Use columns/rows "
+                "for answers below 20 rows and 100 data cells. For larger answers, write "
+                "the complete CSV to answer_csv_path with execute_python and submit "
+                f'{{"from_csv":"{ANSWER_ARTIFACT_HANDLE}"}}. The two modes are mutually '
+                "exclusive. Submit ONLY "
                 "the columns explicitly requested by the question; omit join keys, "
                 "filter values, source columns, rankings, and intermediate "
                 "statistics. Extra columns are penalized. Example: "
                 '{"columns":["average_long_shots"],"rows":[["63.5"]]}.'
             ),
             input_model=AnswerInput,
-            handler=_answer,
+            handler=partial(_answer, artifact_root=artifact_root),
             is_terminal=True,
         ),
         "execute_context_sql": ToolSpec(
@@ -338,10 +424,14 @@ def create_default_tool_registry() -> ToolRegistry:
                 "working directory. The tool returns captured stdout as `output`; stdout and "
                 f"stderr are each capped at {PYTHON_CAPTURE_STREAM_MAX_BYTES // 1024} KiB, "
                 "with the head and tail retained when truncated. "
-                f"The execution timeout is fixed at {EXECUTE_PYTHON_TIMEOUT_SECONDS} seconds."
+                f"The execution timeout is fixed at {EXECUTE_PYTHON_TIMEOUT_SECONDS} seconds. "
+                "A predefined fixed Path named answer_csv_path is available for writing a "
+                "complete answer CSV; never assign or replace this variable. Files are limited "
+                f"to {ANSWER_ARTIFACT_MAX_BYTES // (1024 * 1024)} MiB; submit "
+                f"it with answer(from_csv={ANSWER_ARTIFACT_HANDLE!r})."
             ),
             input_model=ExecutePythonInput,
-            handler=_execute_python,
+            handler=partial(_execute_python, artifact_root=artifact_root),
         ),
         "inspect_sqlite_schema": ToolSpec(
             name="inspect_sqlite_schema",

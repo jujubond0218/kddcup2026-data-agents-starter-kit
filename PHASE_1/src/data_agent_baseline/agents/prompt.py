@@ -12,7 +12,11 @@ Rules:
 1. Inspect the task context through the provided tools before answering.
 2. Base your answer only on information you can observe through the provided tools.
 3. The task is complete only when you call the `answer` tool.
-4. The `answer` tool must receive a table with `columns` and `rows`.
+4. Submit small final tables with `answer(columns=..., rows=...)`. If the complete
+   result has at least 20 rows or 100 data cells, write it to the fixed Path
+   `answer_csv_path` already present in the `execute_python` namespace. Never
+   assign or replace this variable; write directly to that Path, then call
+   `answer(from_csv="answer.csv")`. Never print or copy a large table as a preview.
 5. Call exactly one tool in each turn through the native tool-calling interface.
 6. Do not write or simulate tool calls in plain text or JSON.
 

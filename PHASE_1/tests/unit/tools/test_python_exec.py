@@ -63,6 +63,40 @@ def test_python_execution_captures_stdout_stderr_and_exception(tmp_path):
     assert "ValueError: synthetic failure" in failure["traceback"]
 
 
+def test_python_execution_exposes_fixed_answer_csv_path(tmp_path):
+    artifact_path = tmp_path / "artifact" / "answer.csv"
+    artifact_path.parent.mkdir()
+
+    result = execute_python_code(
+        tmp_path,
+        "answer_csv_path.write_text('code\\n001\\n', encoding='utf-8')",
+        timeout_seconds=5,
+        answer_csv_path=artifact_path,
+    )
+
+    assert result == {"success": True, "output": "", "stderr": ""}
+    assert artifact_path.read_text(encoding="utf-8") == "code\n001\n"
+
+
+def test_python_execution_rejects_reassigning_answer_csv_path(tmp_path):
+    artifact_path = tmp_path / "artifact" / "answer.csv"
+    artifact_path.parent.mkdir()
+
+    result = execute_python_code(
+        tmp_path,
+        "answer_csv_path = 'answer.csv'\nPath(answer_csv_path).write_text('bad')",
+        timeout_seconds=5,
+        answer_csv_path=artifact_path,
+    )
+
+    assert result["success"] is False
+    assert result["output"] == ""
+    assert result["stderr"] == ""
+    assert "predefined Path" in result["error"]
+    assert not artifact_path.exists()
+    assert not (tmp_path / "answer.csv").exists()
+
+
 def test_python_execution_truncates_large_stdout_with_consistent_metadata(tmp_path):
     result = execute_python_code(
         tmp_path,

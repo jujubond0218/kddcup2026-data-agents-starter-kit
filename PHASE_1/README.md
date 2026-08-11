@@ -217,7 +217,10 @@ Agent then decomposes the task and submits its guide in one model request. Only 
 cannot resolve a critical source or field may it make one targeted follow-up; the second request
 exposes `report` only, and the follow-up receives its observation under the original call ID.
 An `answer` call must also pass deterministic CSV-safety verification before it can terminate
-the task; rejected candidates receive a recoverable tool observation for correction.
+the task; rejected candidates receive a recoverable tool observation for correction. Small
+answers use inline `columns` and `rows`. Results with at least 20 rows or 100 data cells are
+written to the attempt-scoped `answer_csv_path` exposed by `execute_python` and submitted as the
+fixed `answer.csv` handle, so the model does not have to regenerate every row as tool arguments.
 The main Agent receives one step-budget reminder after 70% of its normal steps and one critical
 reminder after 90%. If its final normal step calls a non-terminal tool after exploration has
 finished, that tool is not executed: the runtime returns `FINAL_STEP_REQUIRES_ANSWER` under the
@@ -238,10 +241,12 @@ The baseline exposes these tools to the model:
 | `read_doc` | Read a text document preview. | `path`, `max_chars` |
 | `inspect_sqlite_schema` | Inspect tables in a SQLite / DB file. | `path` |
 | `execute_context_sql` | Execute read-only SQL against a SQLite / DB file in `context/`. | `path`, `sql`, `limit` |
-| `execute_python` | Execute Python code inside the task `context/` directory in a clean spawned child process with a fixed 30-second execution limit and bounded cleanup. Returned stdout and stderr are each capped at 64 KiB; truncated streams retain their beginning and end plus byte-count metadata. This lifecycle isolation is not an OS security sandbox. | `code` |
-| `answer` | Submit the final answer table and terminate the task. | `columns`, `rows` |
+| `execute_python` | Execute Python code inside the task `context/` directory in a clean spawned child process with a fixed 30-second execution limit and bounded cleanup. Returned stdout and stderr are each capped at 64 KiB; truncated streams retain their beginning and end plus byte-count metadata. Each attempt also exposes a fixed `answer_csv_path` for a complete answer artifact of at most 5 MiB. This lifecycle isolation is not an OS security sandbox. | `code` |
+| `answer` | Submit the final answer table and terminate the task. Inline and artifact modes are mutually exclusive. | `columns`, `rows` or `from_csv: "answer.csv"` |
 
-All file paths passed to tools must be relative to the task `context/` directory.
+Input-reading paths must be relative to the task `context/` directory. Generated answers use a
+separate capability root: Python may write only the Runner-provided `answer_csv_path`, and
+`answer.from_csv` accepts only the fixed relative handle `answer.csv` for the current attempt.
 Recoverable file errors from the main tools include structured correction guidance:
 `PATH_NOT_FOUND` directs the model to `list_context` or an exact path from the Explorer report,
 while `NOT_SQLITE` recommends the reader matching a non-SQLite file. Both mark

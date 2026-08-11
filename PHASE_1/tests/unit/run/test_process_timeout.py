@@ -21,9 +21,10 @@ def _config(tmp_path: Path, *, timeout_seconds: float) -> AppConfig:
     )
 
 
-def _slow_worker(task_id, config, result_path, events_path):
+def _slow_worker(task_id, config, result_path, events_path, artifact_root):
     del config
     del result_path
+    del artifact_root
     recorder = JsonlEventRecorder(events_path, task_id=task_id)
     recorder.emit(
         "step_completed",
@@ -47,9 +48,10 @@ def _slow_worker(task_id, config, result_path, events_path):
     time.sleep(10)
 
 
-def _large_result_worker(task_id, config, result_path, events_path):
+def _large_result_worker(task_id, config, result_path, events_path, artifact_root):
     del config
     del events_path
+    del artifact_root
     _write_json(
         result_path,
         {
@@ -69,12 +71,15 @@ def _large_result_worker(task_id, config, result_path, events_path):
 def test_timeout_preserves_completed_steps_and_current_request(tmp_path):
     task_output_dir = tmp_path / "run" / "task_1"
     task_output_dir.mkdir(parents=True)
+    artifact_root = task_output_dir / ".answer-artifact-test"
+    artifact_root.mkdir()
     started_at = time.perf_counter()
 
     result = _run_single_task_with_timeout(
         task_id="task_1",
         config=_config(tmp_path, timeout_seconds=0.15),
         task_output_dir=task_output_dir,
+        artifact_root=artifact_root,
         worker_target=_slow_worker,
     )
 
@@ -92,11 +97,14 @@ def test_timeout_preserves_completed_steps_and_current_request(tmp_path):
 def test_large_worker_result_does_not_use_blocking_queue(tmp_path):
     task_output_dir = tmp_path / "run" / "task_1"
     task_output_dir.mkdir(parents=True)
+    artifact_root = task_output_dir / ".answer-artifact-test"
+    artifact_root.mkdir()
 
     result = _run_single_task_with_timeout(
         task_id="task_1",
         config=_config(tmp_path, timeout_seconds=2.0),
         task_output_dir=task_output_dir,
+        artifact_root=artifact_root,
         worker_target=_large_result_worker,
     )
 
