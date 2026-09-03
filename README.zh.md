@@ -1,6 +1,6 @@
 <div align="center">
 
-# KDD Cup 2026 DataAgent-Bench — Phase 1 工程化 Fork
+# Data Agent Runtime｜KDD Cup 2026 Phase 1 个人工程项目
 
 [English](README.md) | 中文
 
@@ -10,14 +10,25 @@
 </div>
 
 > [!NOTE]
-> 本仓库是
+> 本仓库是基于
 > [KDD Cup 2026 官方 Starter Kit](https://github.com/HKUSTDial/kddcup2026-data-agents-starter-kit)
-> 的个人研究 Fork。个人改造仅覆盖 Phase 1，Phase 2 保持官方基线；项目来源和范围见
-> [NOTICE.md](NOTICE.md)。
+> 开发的个人工程项目。上游提供赛事任务接口和教学型 ReAct baseline；下文所述 Runtime、
+> 工具协议、规划、校验与评测改造均落在本 Fork 的 Phase 1 中，Phase 2 保持上游原样。
+> 完整来源和贡献范围见 [NOTICE.md](NOTICE.md)。
 
 本项目将教学型 Phase 1 ReAct baseline 改造成可复现的数据分析 Agent 实验系统，处理
 CSV、JSON、SQLite、Markdown、文本和文本型 PDF 等异构输入。核心价值是建立完整的工程
 闭环，并明确区分运行成功、协议正确、过程可审计和答案语义正确四类指标。
+
+## 官方基线与个人实现边界
+
+| 层次 | 官方 Starter Kit | 个人 Phase 1 实现 |
+| --- | --- | --- |
+| 项目范围 | Phase 1/2 任务格式、数据集接口、基础 CLI 与最小 ReAct baseline | 面向工程可靠性与可审计性的 Phase 1 Data Agent Runtime；不将 Phase 2 计入个人实现 |
+| 工具协议 | Prompt 中生成文本 JSON action，并提供基础数据工具 | 原生 Function Calling、统一工具注册表、Pydantic 严格校验、call ID 对齐与可恢复 observation |
+| 上下文与规划 | 主 ReAct Agent 直接检查任务文件 | 确定性 Context Inventory、有界 Explorer、保守答案投影与可选 Evidence Plan 协议 |
+| 运行与交付 | 基础任务执行与 `prediction.csv` 输出 | 请求重试、进程级硬超时、实时事件、批次恢复重跑、有界 Python 生命周期与 CSV artifact 交付 |
+| 评测与质量 | 面向提交的 baseline 工作流 | 本地 scorer、确定性 Answer Verifier、固定回归集、自动化测试、实验记录与 go/no-go 决策 |
 
 ## Phase 1 核心改造
 
