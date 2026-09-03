@@ -1,6 +1,6 @@
 <div align="center">
 
-# KDD Cup 2026 DataAgent-Bench — Phase 1 Engineering Fork
+# Data Agent Runtime — KDD Cup 2026 Phase 1 Engineering Project
 
 English | [中文](README.zh.md)
 
@@ -10,15 +10,27 @@ English | [中文](README.zh.md)
 </div>
 
 > [!NOTE]
-> This is a personal research fork of the
+> This is a personal engineering project built on the
 > [official KDD Cup 2026 starter kit](https://github.com/HKUSTDial/kddcup2026-data-agents-starter-kit).
-> The work in this fork is limited to Phase 1; Phase 2 remains the upstream baseline. See
-> [NOTICE.md](NOTICE.md) for project provenance and scope.
+> The upstream repository provides the benchmark interface and instructional ReAct baseline. The
+> Phase 1 runtime, tool protocol, planning, verification, and evaluation work described below was
+> implemented in this fork; Phase 2 remains unchanged from upstream. See [NOTICE.md](NOTICE.md) for
+> full provenance and scope.
 
 This project turns the instructional Phase 1 ReAct baseline into a reproducible data-agent
 research harness for heterogeneous CSV, JSON, SQLite, Markdown, text, and text-based PDF inputs.
 The main contribution is an end-to-end engineering loop that separates runtime success,
 protocol correctness, auditability, and semantic answer quality.
+
+## Upstream Baseline vs Personal Implementation
+
+| Layer | Official starter kit | Personal Phase 1 implementation |
+| --- | --- | --- |
+| Project scope | Phase 1/2 task formats, dataset interface, basic CLI, and minimal ReAct baseline | An engineering-focused Phase 1 data-agent runtime; no personal implementation is claimed for Phase 2 |
+| Tool protocol | Prompt-formatted text JSON actions and basic data tools | Native Function Calling, a unified tool registry, strict Pydantic validation, matched call IDs, and recoverable observations |
+| Context and planning | The main ReAct Agent inspects task files directly | Deterministic context inventory, bounded Explorer, conservative answer projection, and an opt-in Evidence Plan protocol |
+| Runtime and delivery | Basic task execution and `prediction.csv` output | Request retries, process-level hard timeouts, live events, batch resume/retry, bounded Python lifecycle, and CSV artifact handoff |
+| Evaluation and quality | Submission-oriented baseline workflow | Local scorer, deterministic answer verifier, fixed regressions, automated tests, experiment records, and explicit go/no-go decisions |
 
 ## Phase 1 Highlights
 
